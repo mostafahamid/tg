@@ -1,0 +1,1022 @@
+/**
+ * V2Ray Manager - Version 117.1 (بدون گیت‌هاب و سایت)
+ * فقط ربات تلگرام - حذف fetch خودکار از گیت‌هاب و حذف سایت HTML
+ * حفظ: V2Ray Configs, NPV2 Files, VIP System, Invite Friends
+ */
+
+function getTehranTime() {
+  return new Date().toLocaleString('fa-IR', {
+    timeZone: 'Asia/Tehran',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    const BOT_TOKEN = env.BOT_TOKEN;
+    const ADMIN_ID = String(env.ADMIN_ID);
+    const BOT_USERNAME = "vxconfig_bot";
+    const MESSAGES_PER_PAGE = 5;
+
+    if (request.method === "GET") {
+      return new Response("V2Ray Bot v118.0 - Running");
+    }
+
+    if (request.method !== "POST") {
+      return new Response("V2Ray Bot v118.0 - Running");
+    }
+
+    try {
+      const update = await request.json();
+
+      // ========== callback_query ==========
+      if (update.callback_query) {
+        const callbackData = update.callback_query.data;
+        const callbackChatId = update.callback_query.message.chat.id;
+        const callbackUserId = String(update.callback_query.from.id);
+        const callbackMessageId = update.callback_query.message.message_id;
+        const isAdminCallback = (callbackUserId === ADMIN_ID);
+
+        await sendTelegram(BOT_TOKEN, "answerCallbackQuery", {
+          callback_query_id: update.callback_query.id
+        });
+
+        // بررسی مجدد عضویت
+        if (callbackData === "recheck_join") {
+          const channelsList = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+          let notJoinedChannels = [];
+          for (const channel of channelsList) {
+            const cleanChannel = channel.startsWith('@') ? channel : `@${channel}`;
+            try {
+              const memberData = await fetch(
+                `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(cleanChannel)}&user_id=${callbackUserId}`
+              ).then(r => r.json());
+              const validStatuses = ["member", "creator", "administrator", "restricted"];
+              if (!memberData.ok || !validStatuses.includes(memberData.result?.status)) {
+                notJoinedChannels.push(cleanChannel);
+              }
+            } catch {
+              notJoinedChannels.push(cleanChannel);
+            }
+          }
+          if (notJoinedChannels.length > 0) {
+            const channelsKeyboard = notJoinedChannels.map(ch => {
+              const cleanName = ch.replace('@', '');
+              return [{ text: `📢 عضویت در ${ch}`, url: `https://t.me/${cleanName}` }];
+            });
+            channelsKeyboard.push([{ text: "✅ بررسی مجدد عضویت", callback_data: "recheck_join" }]);
+            await sendTelegram(BOT_TOKEN, "editMessageText", {
+              chat_id: callbackChatId,
+              message_id: callbackMessageId,
+              text: `❌ <b>عضویت تأیید نشد!</b>\n\nهنوز در کانال‌های زیر عضو نشده‌اید:\n${notJoinedChannels.map(ch => `• ${ch}`).join('\n')}\n\nپس از عضویت دکمه زیر را بزنید.`,
+              parse_mode: "HTML",
+              reply_markup: { inline_keyboard: channelsKeyboard }
+            });
+          } else {
+            await sendTelegram(BOT_TOKEN, "editMessageText", {
+              chat_id: callbackChatId,
+              message_id: callbackMessageId,
+              text: `✅ <b>عضویت شما تأیید شد!</b>\n\n🎉 اکنون می‌توانید از ربات استفاده کنید.\nلطفاً /start را بزنید.`,
+              parse_mode: "HTML",
+              reply_markup: { inline_keyboard: [] }
+            });
+          }
+          return new Response("OK");
+        }
+
+        // انصراف از پاسخ
+        if (callbackData === "cancel_reply" && isAdminCallback) {
+          await env.DATA_KV.delete(`reply_target_${ADMIN_ID}`);
+          await sendTelegram(BOT_TOKEN, "editMessageText", {
+            chat_id: callbackChatId,
+            message_id: callbackMessageId,
+            text: "❌ پاسخ لغو شد.",
+            reply_markup: { inline_keyboard: [] }
+          });
+          return new Response("OK");
+        }
+
+        // پاسخ به پیام کاربر
+        if (callbackData && callbackData.startsWith("reply_msg_") && isAdminCallback) {
+          const targetUserId = callbackData.replace("reply_msg_", "");
+          await env.DATA_KV.put(`reply_target_${ADMIN_ID}`, targetUserId);
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: `✍️ پاسخ خود را برای کاربر ${targetUserId} بنویسید:\n\n(متن، عکس، فیلم یا فایل)`,
+            reply_markup: {
+              inline_keyboard: [[{ text: "❌ انصراف از پاسخ", callback_data: "cancel_reply" }]]
+            }
+          });
+          return new Response("OK");
+        }
+
+        // pagination پیام‌ها
+        if (callbackData && callbackData.startsWith("msgs_page_") && isAdminCallback) {
+          const page = parseInt(callbackData.replace("msgs_page_", ""));
+          await sendMessagesPage(env, BOT_TOKEN, callbackChatId, page, MESSAGES_PER_PAGE);
+          return new Response("OK");
+        }
+
+        // VIP: دادن VIP به کاربر توسط ادمین
+        if (callbackData && callbackData.startsWith("vip_grant_") && isAdminCallback) {
+          const targetUid = callbackData.replace("vip_grant_", "");
+          await setVIP(env, targetUid, true);
+          await sendTelegram(BOT_TOKEN, "editMessageText", {
+            chat_id: callbackChatId,
+            message_id: callbackMessageId,
+            text: `✅ کاربر ${targetUid} به VIP ارتقا یافت.`,
+            reply_markup: { inline_keyboard: [] }
+          });
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: targetUid,
+            text: `🌟 <b>تبریک! اکنون VIP هستید.</b>\n\nادمین به شما دسترسی VIP داد.\nاز منو گزینه «⭐️ سرور VIP» را انتخاب کنید.`,
+            parse_mode: "HTML"
+          });
+          return new Response("OK");
+        }
+
+        // VIP: گرفتن VIP از کاربر توسط ادمین
+        if (callbackData && callbackData.startsWith("vip_revoke_") && isAdminCallback) {
+          const targetUid = callbackData.replace("vip_revoke_", "");
+          await setVIP(env, targetUid, false);
+          await sendTelegram(BOT_TOKEN, "editMessageText", {
+            chat_id: callbackChatId,
+            message_id: callbackMessageId,
+            text: `❌ دسترسی VIP کاربر ${targetUid} لغو شد.`,
+            reply_markup: { inline_keyboard: [] }
+          });
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: targetUid,
+            text: `⚠️ دسترسی VIP شما توسط ادمین لغو شد.`,
+            parse_mode: "HTML"
+          });
+          return new Response("OK");
+        }
+
+        // منوی VIP ادمین
+        if (callbackData === "toggle_vip_system" && isAdminCallback) {
+          const current = await env.DATA_KV.get("vip_system_enabled");
+          const newStatus = current === "false" ? "true" : "false";
+          await env.DATA_KV.put("vip_system_enabled", newStatus);
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: `✅ سیستم VIP ${newStatus === "true" ? "فعال" : "غیرفعال"} شد.`
+          });
+          await showVIPMenu(env, BOT_TOKEN, callbackChatId);
+          return new Response("OK");
+        }
+
+        if (callbackData === "change_vip_threshold" && isAdminCallback) {
+          await env.DATA_KV.put(`admin_state_${ADMIN_ID}`, "waiting_vip_threshold");
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: "🔢 تعداد دعوت لازم برای VIP را وارد کنید:\n\nمثال: 3"
+          });
+          return new Response("OK");
+        }
+
+        if (callbackData === "vip_manage_user" && isAdminCallback) {
+          await env.DATA_KV.put(`admin_state_${ADMIN_ID}`, "waiting_vip_manage_userid");
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: "👤 آیدی عددی کاربر مورد نظر را وارد کنید:"
+          });
+          return new Response("OK");
+        }
+
+        if (callbackData === "back_to_vip_menu" && isAdminCallback) {
+          await showVIPMenu(env, BOT_TOKEN, callbackChatId);
+          return new Response("OK");
+        }
+
+        // افزودن کانال
+        if (callbackData === "add_channel" && isAdminCallback) {
+          await env.DATA_KV.put(`admin_state_${ADMIN_ID}`, "waiting_add_channel");
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: "📢 لطفاً آیدی کانال را با @ وارد کنید:\n\nمثال: @my_channel\n\n⚠️ ربات باید در کانال ادمین باشد!",
+            reply_markup: { force_reply: true }
+          });
+          return new Response("OK");
+        }
+
+        if (callbackData === "remove_channel" && isAdminCallback) {
+          const channels = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+          if (channels.length === 0) {
+            await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: callbackChatId, text: "❌ هیچ کانالی وجود ندارد." });
+          } else {
+            const keyboard = { inline_keyboard: [] };
+            for (const ch of channels) {
+              keyboard.inline_keyboard.push([{ text: `❌ ${ch}`, callback_data: `remove_this_channel_${encodeURIComponent(ch)}` }]);
+            }
+            keyboard.inline_keyboard.push([{ text: "🔙 بازگشت", callback_data: "back_to_force_join" }]);
+            await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: callbackChatId, text: "🗑 کانال مورد نظر:", reply_markup: keyboard });
+          }
+          return new Response("OK");
+        }
+
+        if (callbackData && callbackData.startsWith("remove_this_channel_") && isAdminCallback) {
+          const channelToRemove = decodeURIComponent(callbackData.replace("remove_this_channel_", ""));
+          let channels = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+          channels = channels.filter(ch => ch !== channelToRemove);
+          await env.DATA_KV.put("required_channels", JSON.stringify(channels));
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: callbackChatId, text: `✅ کانال ${channelToRemove} حذف شد.` });
+          await showForceJoinMenu(env, BOT_TOKEN, callbackChatId);
+          return new Response("OK");
+        }
+
+        if (callbackData === "toggle_force_join" && isAdminCallback) {
+          const current = await env.DATA_KV.get("force_join_enabled");
+          const newStatus = current === "false" ? "true" : "false";
+          await env.DATA_KV.put("force_join_enabled", newStatus);
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: `✅ عضویت اجباری ${newStatus === "true" ? "فعال" : "غیرفعال"} شد.`
+          });
+          await showForceJoinMenu(env, BOT_TOKEN, callbackChatId);
+          return new Response("OK");
+        }
+
+        if (callbackData === "back_to_force_join" && isAdminCallback) {
+          await showForceJoinMenu(env, BOT_TOKEN, callbackChatId);
+          return new Response("OK");
+        }
+
+        if (callbackData === "back_to_admin_panel" && isAdminCallback) {
+          await clearAdminState(env, ADMIN_ID);
+          await sendAdminPanel(BOT_TOKEN, callbackChatId);
+          return new Response("OK");
+        }
+
+        if (callbackData === "show_referral" && !isAdminCallback) {
+          const referralLink = `https://t.me/${BOT_USERNAME}?start=ref_${callbackUserId}`;
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: callbackChatId,
+            text: `🔗 لینک دعوت اختصاصی شما:\n<code>${referralLink}</code>`,
+            parse_mode: "HTML"
+          });
+          return new Response("OK");
+        }
+
+        return new Response("OK");
+      }
+
+      // ========== پیام‌های معمولی ==========
+      const msg = update.message;
+      if (!msg) return new Response("OK");
+
+      const text = msg.text || "";
+      const userId = String(msg.from.id);
+      const chatId = msg.chat.id;
+      const isAdmin = (userId === ADMIN_ID);
+
+      // ثبت کاربر + پردازش لینک دعوت
+      const isNewUser = await addUser(env, userId);
+
+      if (isNewUser && text.startsWith("/start ref_")) {
+        const inviterId = text.replace("/start ref_", "").trim();
+        if (inviterId && inviterId !== userId) {
+          await processReferral(env, BOT_TOKEN, inviterId, userId);
+        }
+      }
+
+      // force join
+      const isForceJoinActive = await env.DATA_KV.get("force_join_enabled") !== "false";
+      let channelsList = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+      const oldChannel = await env.DATA_KV.get("forced_channel");
+      if (oldChannel && !channelsList.includes(oldChannel)) {
+        channelsList.push(oldChannel);
+        await env.DATA_KV.put("required_channels", JSON.stringify(channelsList));
+      }
+
+      if (!isAdmin && isForceJoinActive && channelsList.length > 0) {
+        let notJoinedChannels = [];
+        for (const channel of channelsList) {
+          const cleanChannel = channel.startsWith('@') ? channel : `@${channel}`;
+          try {
+            const memberData = await fetch(
+              `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(cleanChannel)}&user_id=${userId}`
+            ).then(r => r.json());
+            const validStatuses = ["member", "creator", "administrator", "restricted"];
+            if (!memberData.ok || !validStatuses.includes(memberData.result?.status)) {
+              notJoinedChannels.push(cleanChannel);
+            }
+          } catch {
+            notJoinedChannels.push(cleanChannel);
+          }
+        }
+        if (notJoinedChannels.length > 0) {
+          const channelsKeyboard = notJoinedChannels.map(ch => {
+            const cleanName = ch.replace('@', '');
+            return [{ text: `📢 عضویت در ${ch}`, url: `https://t.me/${cleanName}` }];
+          });
+          channelsKeyboard.push([{ text: "✅ بررسی مجدد عضویت", callback_data: "recheck_join" }]);
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ <b>دسترسی محدود شده است!</b>\n\nبرای استفاده از ربات، ابتدا در کانال‌های زیر عضو شوید:\n${notJoinedChannels.map(ch => `• ${ch}`).join('\n')}\n\nپس از عضویت، روی دکمه زیر کلیک کنید.`,
+            parse_mode: "HTML",
+            reply_markup: { inline_keyboard: channelsKeyboard }
+          });
+          return new Response("OK");
+        }
+      }
+
+      // منوی اصلی
+      if (text === "/start" || text.startsWith("/start ") || text === "🏠 منوی اصلی" || text === "بازگشت") {
+        const isVip = await isUserVIP(env, userId);
+        const vipSystemEnabled = await env.DATA_KV.get("vip_system_enabled") !== "false";
+
+        const keyboard = {
+          keyboard: [
+            [{ text: "🚀 سرور V2Ray" }],
+            [{ text: "📁 فایل‌های NPV2" }],
+            [{ text: "📩 پیام به ادمین" }]
+          ],
+          resize_keyboard: true,
+          persistent: true
+        };
+
+        if (vipSystemEnabled) {
+          if (isVip) {
+            keyboard.keyboard.splice(1, 0, [{ text: "⭐️ سرور VIP" }]);
+          }
+          keyboard.keyboard.push([{ text: "🎁 دعوت دوستان" }]);
+        }
+
+        if (isAdmin) keyboard.keyboard.push([{ text: "⚙️ پنل مدیریت" }]);
+
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `🚀 به ربات V2Ray خوش آمدید!\n🤖 @${BOT_USERNAME}${isVip ? "\n\n⭐️ شما کاربر VIP هستید!" : ""}\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:`,
+          reply_markup: keyboard
+        });
+        return new Response("OK");
+      }
+
+      // ========== سرور V2Ray ==========
+      if (text === "🚀 سرور V2Ray") {
+        let configs = JSON.parse(await env.DATA_KV.get("configs_v2ray") || "[]");
+        if (configs.length === 0) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ کدی موجود نیست. لطفاً بعداً امتحان کنید." });
+          return new Response("OK");
+        }
+        const shuffled = [...configs];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        const selected = shuffled.slice(0, 5);
+        let responseText = "🚀 ۵ کد سرور V2Ray برای شما:\n\n";
+        for (const cfg of selected) responseText += `<code>${cfg}</code>\n\n━━━━━━━━━━━━━━━\n\n`;
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId, text: responseText, parse_mode: "HTML", disable_web_page_preview: true
+        });
+        let stats = JSON.parse(await env.DATA_KV.get(`user_stats_${userId}`) || '{"count":0,"last_download":null}');
+        stats.count++;
+        stats.last_download = new Date().toISOString();
+        await env.DATA_KV.put(`user_stats_${userId}`, JSON.stringify(stats));
+        return new Response("OK");
+      }
+
+      // ========== سرور VIP ==========
+      if (text === "⭐️ سرور VIP") {
+        const vipSystemEnabled = await env.DATA_KV.get("vip_system_enabled") !== "false";
+        if (!vipSystemEnabled) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ سیستم VIP فعلاً غیرفعال است." });
+          return new Response("OK");
+        }
+
+        const isVip = await isUserVIP(env, userId);
+        if (!isVip && !isAdmin) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: "⭐️ شما VIP نیستید!\n\nبرای VIP شدن دوستان خود را دعوت کنید.",
+            reply_markup: { inline_keyboard: [[{ text: "🎁 لینک دعوت من", callback_data: "show_referral" }]] }
+          });
+          return new Response("OK");
+        }
+
+        let vipConfigs = JSON.parse(await env.DATA_KV.get("configs_vip") || "[]");
+        if (vipConfigs.length === 0) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ کانفیگ VIP موجود نیست. لطفاً بعداً امتحان کنید." });
+          return new Response("OK");
+        }
+
+        const shuffled = [...vipConfigs];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        const selected = shuffled.slice(0, 5);
+        let responseText = "⭐️ <b>۵ کانفیگ اختصاصی VIP برای شما:</b>\n\n";
+        for (const cfg of selected) responseText += `<code>${cfg}</code>\n\n━━━━━━━━━━━━━━━\n\n`;
+
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId, text: responseText, parse_mode: "HTML", disable_web_page_preview: true
+        });
+        return new Response("OK");
+      }
+
+      // ========== دعوت دوستان ==========
+      if (text === "🎁 دعوت دوستان") {
+        const vipSystemEnabled = await env.DATA_KV.get("vip_system_enabled") !== "false";
+        if (!vipSystemEnabled) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ سیستم VIP فعلاً غیرفعال است." });
+          return new Response("OK");
+        }
+
+        const referralData = await getReferralData(env, userId);
+        const threshold = parseInt(await env.DATA_KV.get("vip_referral_threshold") || "2");
+        const isVip = await isUserVIP(env, userId);
+        const referralLink = `https://t.me/${BOT_USERNAME}?start=ref_${userId}`;
+        const remaining = Math.max(0, threshold - referralData.count);
+
+        let statusText = isVip
+          ? "⭐️ شما VIP هستید!"
+          : `📊 پیشرفت: ${referralData.count} از ${threshold} دعوت\n${"🟩".repeat(referralData.count)}${"⬜️".repeat(Math.max(0, threshold - referralData.count))}\n\n${remaining > 0 ? `⏳ ${remaining} دعوت دیگر تا VIP` : "✅ شرایط رو دارید، منتظر تأیید باشید"}`;
+
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `🎁 <b>دعوت دوستان</b>\n\n${statusText}\n\n🔗 لینک دعوت اختصاصی شما:\n<code>${referralLink}</code>\n\nهر دوستی که با این لینک بیاد، یک دعوت برای شما ثبت میشه.\nبا ${threshold} دعوت موفق VIP می‌شید!`,
+          parse_mode: "HTML"
+        });
+        return new Response("OK");
+      }
+
+      // ========== فایل‌های NPV2 ==========
+      if (text === "📁 فایل‌های NPV2") {
+        const npvFiles = JSON.parse(await env.DATA_KV.get("configs_npv") || "[]");
+        const files = npvFiles.filter(f => f.type === "file").slice(0, 3);
+        if (files.length === 0) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ فایل NPV2 موجود نیست." });
+        } else {
+          for (const file of files) {
+            await sendTelegram(BOT_TOKEN, "sendDocument", {
+              chat_id: chatId, document: file.file_id, caption: `🌀 فایل کانفیگ NPV2\nبرای اپ NapsternetV`
+            });
+          }
+        }
+        return new Response("OK");
+      }
+
+      // ========== پیام به ادمین ==========
+      if (text === "📩 پیام به ادمین") {
+        await env.DATA_KV.put(`msg_${userId}`, "waiting");
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: "✍️ لطفاً پیام خود را بنویسید:\n(پشتیبانی از متن، عکس، فیلم و فایل)",
+          reply_markup: { keyboard: [[{ text: "🔙 انصراف" }]], resize_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      if (text === "🔙 انصراف") {
+        await env.DATA_KV.delete(`msg_${userId}`);
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: "❌ لغو شد.",
+          reply_markup: { keyboard: [[{ text: "🏠 منوی اصلی" }]], resize_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      // دریافت پیام کاربر
+      const isWaitingMsg = await env.DATA_KV.get(`msg_${userId}`);
+      if (isWaitingMsg === "waiting" && !isAdmin) {
+        await env.DATA_KV.delete(`msg_${userId}`);
+        const tehranTime = getTehranTime();
+        let messageText = `📩 <b>پیام جدید از کاربر</b>\n\n👤 کاربر: ${userId}\n🆔 آیدی: @${msg.from?.username || "ندارد"}\n📅 ${tehranTime}\n\n`;
+
+        if (msg.text) {
+          messageText += `📝 متن:\n${msg.text}`;
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: ADMIN_ID, text: messageText, parse_mode: "HTML" });
+        } else if (msg.photo) {
+          messageText += `🖼️ عکس ارسال شده`;
+          await sendTelegram(BOT_TOKEN, "sendPhoto", { chat_id: ADMIN_ID, photo: msg.photo[msg.photo.length - 1].file_id, caption: messageText, parse_mode: "HTML" });
+        } else if (msg.video) {
+          messageText += `🎬 فیلم ارسال شده`;
+          await sendTelegram(BOT_TOKEN, "sendVideo", { chat_id: ADMIN_ID, video: msg.video.file_id, caption: messageText, parse_mode: "HTML" });
+        } else if (msg.document) {
+          messageText += `📎 فایل: ${msg.document.file_name}`;
+          await sendTelegram(BOT_TOKEN, "sendDocument", { chat_id: ADMIN_ID, document: msg.document.file_id, caption: messageText, parse_mode: "HTML" });
+        }
+
+        let messages = JSON.parse(await env.DATA_KV.get("admin_messages") || "[]");
+        messages.unshift({
+          id: Date.now(), userId, username: msg.from?.username || null,
+          text: msg.text || null, hasMedia: !!(msg.photo || msg.video || msg.document),
+          date: new Date().toISOString(), datePersian: tehranTime, read: false
+        });
+        await env.DATA_KV.put("admin_messages", JSON.stringify(messages.slice(0, 500)));
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "✅ پیام شما به ادمین ارسال شد." });
+        return new Response("OK");
+      }
+
+      // پاسخ ادمین به کاربر
+      const replyTarget = await env.DATA_KV.get(`reply_target_${ADMIN_ID}`);
+      if (isAdmin && replyTarget && (msg.text || msg.photo || msg.video || msg.document)) {
+        const menuButtons = ["⚙️ پنل مدیریت", "🏠 منوی اصلی", "📊 آمار کامل سیستم",
+          "📩 مشاهده پیام‌های کاربران", "🔘 تنظیم عضویت اجباری", "🗑 پاکسازی (تفکیک شده)",
+          "📢 ارسال همگانی", "🔙 بازگشت به مدیریت", "⭐️ مدیریت VIP",
+          "➕ افزودن کد V2Ray", "📁 افزودن فایل NPV2"];
+
+        if (menuButtons.includes(text)) {
+          await env.DATA_KV.delete(`reply_target_${ADMIN_ID}`);
+        } else {
+          try {
+            if (msg.text) {
+              await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: replyTarget, text: `📩 <b>پاسخ از مدیریت:</b>\n\n${msg.text}`, parse_mode: "HTML" });
+            } else if (msg.photo) {
+              await sendTelegram(BOT_TOKEN, "sendPhoto", { chat_id: replyTarget, photo: msg.photo[msg.photo.length - 1].file_id, caption: "📩 پاسخ از مدیریت" });
+            } else if (msg.video) {
+              await sendTelegram(BOT_TOKEN, "sendVideo", { chat_id: replyTarget, video: msg.video.file_id, caption: "📩 پاسخ از مدیریت" });
+            } else if (msg.document) {
+              await sendTelegram(BOT_TOKEN, "sendDocument", { chat_id: replyTarget, document: msg.document.file_id, caption: "📩 پاسخ از مدیریت" });
+            }
+            await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ پاسخ به کاربر ${replyTarget} ارسال شد.` });
+          } catch {
+            await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ خطا: کاربر ممکن است ربات را بلاک کرده باشد." });
+          }
+          await env.DATA_KV.delete(`reply_target_${ADMIN_ID}`);
+          return new Response("OK");
+        }
+      }
+
+      // پردازش state های ادمین
+      const adminState = await env.DATA_KV.get(`admin_state_${ADMIN_ID}`);
+
+      // افزودن کانال
+      if (isAdmin && adminState === "waiting_add_channel" && msg.text && !msg.text.startsWith("/")) {
+        let channelId = msg.text.trim();
+        if (!channelId.startsWith('@')) channelId = '@' + channelId;
+        let channels = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+        if (!channels.includes(channelId)) {
+          channels.push(channelId);
+          await env.DATA_KV.put("required_channels", JSON.stringify(channels));
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ کانال ${channelId} اضافه شد.` });
+        } else {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `❌ کانال ${channelId} قبلاً اضافه شده.` });
+        }
+        await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+        await showForceJoinMenu(env, BOT_TOKEN, chatId);
+        return new Response("OK");
+      }
+
+      // افزودن فایل NPV2
+      if (isAdmin && adminState === "waiting_add_npv") {
+        if (msg.document) {
+          let npvFiles = JSON.parse(await env.DATA_KV.get("configs_npv") || "[]");
+          npvFiles.unshift({ type: "file", file_id: msg.document.file_id, name: msg.document.file_name, date: new Date().toISOString(), datePersian: getTehranTime() });
+          await env.DATA_KV.put("configs_npv", JSON.stringify(npvFiles.slice(0, 50)));
+          await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+          await sendTelegram(BOT_TOKEN, "sendMessage", {
+            chat_id: chatId, text: "✅ فایل NPV2 اضافه شد.",
+            reply_markup: { keyboard: [[{ text: "⚙️ پنل مدیریت" }]], resize_keyboard: true }
+          });
+        } else {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ لطفاً یک فایل ارسال کنید." });
+        }
+        return new Response("OK");
+      }
+
+      // افزودن کد V2Ray
+      if (isAdmin && adminState === "waiting_add_v2ray" && msg.text && !msg.text.startsWith("/")) {
+        let configs = JSON.parse(await env.DATA_KV.get("configs_v2ray") || "[]");
+        const newLines = msg.text.split("\n").filter(l => l.trim().length > 30);
+        let added = 0;
+        for (const line of newLines) {
+          if (isValidConfigFormat(line) && !configs.includes(line)) { configs.unshift(line); added++; }
+        }
+        await env.DATA_KV.put("configs_v2ray", JSON.stringify(configs.slice(0, 3000)));
+        await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ ${added} کد اضافه شد.\n📊 مجموع: ${configs.length}`,
+          reply_markup: { keyboard: [[{ text: "⚙️ پنل مدیریت" }]], resize_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      // افزودن کانفیگ VIP
+      if (isAdmin && adminState === "waiting_add_vip_config" && msg.text && !msg.text.startsWith("/")) {
+        let vipConfigs = JSON.parse(await env.DATA_KV.get("configs_vip") || "[]");
+        const newLines = msg.text.split("\n").filter(l => l.trim().length > 30);
+        let added = 0;
+        for (const line of newLines) {
+          if (isValidConfigFormat(line) && !vipConfigs.includes(line)) {
+            vipConfigs.unshift(line);
+            added++;
+          }
+        }
+        await env.DATA_KV.put("configs_vip", JSON.stringify(vipConfigs.slice(0, 1000)));
+        await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ ${added} کانفیگ VIP اضافه شد.\n📊 مجموع: ${vipConfigs.length}`,
+          reply_markup: { keyboard: [[{ text: "⚙️ پنل مدیریت" }]], resize_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      // [VIP] تغییر آستانه دعوت
+      if (isAdmin && adminState === "waiting_vip_threshold" && msg.text) {
+        const num = parseInt(msg.text.trim());
+        if (isNaN(num) || num < 1) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ عدد معتبر وارد کنید (حداقل ۱)." });
+        } else {
+          await env.DATA_KV.put("vip_referral_threshold", String(num));
+          await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ تعداد دعوت لازم برای VIP به ${num} تغییر یافت.` });
+          await showVIPMenu(env, BOT_TOKEN, chatId);
+        }
+        return new Response("OK");
+      }
+
+      // [VIP] مدیریت کاربر خاص
+      if (isAdmin && adminState === "waiting_vip_manage_userid" && msg.text) {
+        const targetUid = msg.text.trim();
+        await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+        const isVip = await isUserVIP(env, targetUid);
+        const referralData = await getReferralData(env, targetUid);
+        const threshold = parseInt(await env.DATA_KV.get("vip_referral_threshold") || "2");
+
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `👤 <b>اطلاعات کاربر ${targetUid}</b>\n\n⭐️ وضعیت VIP: ${isVip ? "✅ فعال" : "❌ غیرفعال"}\n📨 تعداد دعوت: ${referralData.count} از ${threshold}`,
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              isVip
+                ? [{ text: "❌ لغو VIP", callback_data: `vip_revoke_${targetUid}` }]
+                : [{ text: "⭐️ دادن VIP", callback_data: `vip_grant_${targetUid}` }],
+              [{ text: "🔙 بازگشت", callback_data: "back_to_vip_menu" }]
+            ]
+          }
+        });
+        return new Response("OK");
+      }
+
+      // broadcast
+      if (isAdmin && adminState === "waiting_broadcast") {
+        if (!msg.text && !msg.photo && !msg.video && !msg.document) {
+          await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "❌ نوع محتوا پشتیبانی نمیشه." });
+          return new Response("OK");
+        }
+        await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+        const users = JSON.parse(await env.DATA_KV.get("users") || "[]");
+        let sent = 0, failed = 0;
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `📤 در حال ارسال به ${users.length} کاربر...` });
+        for (const uid of users) {
+          if (uid === ADMIN_ID) continue;
+          try {
+            if (msg.text) await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: uid, text: msg.text, parse_mode: "HTML" });
+            else if (msg.photo) await sendTelegram(BOT_TOKEN, "sendPhoto", { chat_id: uid, photo: msg.photo[msg.photo.length - 1].file_id, caption: msg.caption || "" });
+            else if (msg.video) await sendTelegram(BOT_TOKEN, "sendVideo", { chat_id: uid, video: msg.video.file_id, caption: msg.caption || "" });
+            else if (msg.document) await sendTelegram(BOT_TOKEN, "sendDocument", { chat_id: uid, document: msg.document.file_id, caption: msg.caption || "" });
+            sent++;
+          } catch { failed++; }
+        }
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ ارسال همگانی تمام شد.\n\n📤 موفق: ${sent}\n❌ ناموفق: ${failed}`,
+          reply_markup: { keyboard: [[{ text: "⚙️ پنل مدیریت" }]], resize_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      // پنل مدیریت
+      if (isAdmin && text === "⚙️ پنل مدیریت") {
+        await clearAdminState(env, ADMIN_ID);
+        await sendAdminPanel(BOT_TOKEN, chatId);
+        return new Response("OK");
+      }
+
+      // [VIP] منوی مدیریت VIP
+      if (isAdmin && text === "⭐️ مدیریت VIP") {
+        await showVIPMenu(env, BOT_TOKEN, chatId);
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🔘 تنظیم عضویت اجباری") {
+        await showForceJoinMenu(env, BOT_TOKEN, chatId);
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "📢 ارسال همگانی") {
+        await env.DATA_KV.put(`admin_state_${ADMIN_ID}`, "waiting_broadcast");
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: "📢 پیام همگانی را ارسال کنید:\n\n(متن، عکس، فیلم یا فایل)\nHTML پشتیبانی میشه.",
+          reply_markup: { remove_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      // دکمه‌های افزودن در پنل مدیریت
+      if (isAdmin && text === "➕ افزودن کد V2Ray") {
+        await env.DATA_KV.put(`admin_state_${ADMIN_ID}`, "waiting_add_v2ray");
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId,
+          text: "📝 کدهای V2Ray را ارسال کنید (هر خط یک کد):\n\nپشتیبانی از: vmess:// , vless:// , trojan:// , ss://",
+          reply_markup: { remove_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "📁 افزودن فایل NPV2") {
+        await env.DATA_KV.put(`admin_state_${ADMIN_ID}`, "waiting_add_npv");
+        await sendTelegram(BOT_TOKEN, "sendMessage", {
+          chat_id: chatId, text: "📁 فایل NPV2 خود را ارسال کنید:",
+          reply_markup: { remove_keyboard: true }
+        });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🗑 پاکسازی (تفکیک شده)") {
+        const keyboard = {
+          keyboard: [
+            [{ text: "🗑 پاکسازی کدهای V2Ray" }],
+            [{ text: "🗑 پاکسازی فایل‌های NPV2" }],
+            [{ text: "🗑 پاکسازی کانفیگ‌های VIP" }],
+            [{ text: "🗑 پاکسازی کاربران" }],
+            [{ text: "🗑 پاکسازی همه" }],
+            [{ text: "🔙 بازگشت به مدیریت" }]
+          ],
+          resize_keyboard: true
+        };
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "🗑 کدام بخش؟", reply_markup: keyboard });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🗑 پاکسازی کدهای V2Ray") {
+        const before = JSON.parse(await env.DATA_KV.get("configs_v2ray") || "[]").length;
+        await env.DATA_KV.put("configs_v2ray", JSON.stringify([]));
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ ${before} کد V2Ray حذف شدند.` });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🗑 پاکسازی فایل‌های NPV2") {
+        const before = JSON.parse(await env.DATA_KV.get("configs_npv") || "[]").length;
+        await env.DATA_KV.put("configs_npv", JSON.stringify([]));
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ ${before} فایل NPV2 حذف شدند.` });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🗑 پاکسازی کانفیگ‌های VIP") {
+        const before = JSON.parse(await env.DATA_KV.get("configs_vip") || "[]").length;
+        await env.DATA_KV.put("configs_vip", JSON.stringify([]));
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ ${before} کانفیگ VIP حذف شدند.` });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🗑 پاکسازی کاربران") {
+        const before = JSON.parse(await env.DATA_KV.get("users") || "[]").length;
+        await env.DATA_KV.put("users", JSON.stringify([]));
+        await env.DATA_KV.put("user_stats", JSON.stringify({}));
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: `✅ ${before} کاربر حذف شدند.` });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🗑 پاکسازی همه") {
+        await env.DATA_KV.put("configs_v2ray", JSON.stringify([]));
+        await env.DATA_KV.put("configs_vip", JSON.stringify([]));
+        await env.DATA_KV.put("configs_npv", JSON.stringify([]));
+        await env.DATA_KV.put("users", JSON.stringify([]));
+        await env.DATA_KV.put("user_stats", JSON.stringify({}));
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "✅ تمام دیتابیس‌ها پاکسازی شدند." });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "🔙 بازگشت به مدیریت") {
+        await clearAdminState(env, ADMIN_ID);
+        await sendAdminPanel(BOT_TOKEN, chatId);
+        return new Response("OK");
+      }
+
+      // آمار
+      if (isAdmin && text === "📊 آمار کامل سیستم") {
+        const users = JSON.parse(await env.DATA_KV.get("users") || "[]");
+        const configs = JSON.parse(await env.DATA_KV.get("configs_v2ray") || "[]");
+        const vipConfigs = JSON.parse(await env.DATA_KV.get("configs_vip") || "[]");
+        const npv = JSON.parse(await env.DATA_KV.get("configs_npv") || "[]");
+        const messages = JSON.parse(await env.DATA_KV.get("admin_messages") || "[]");
+        const unread = messages.filter(m => !m.read).length;
+        let totalDownloads = 0;
+        let vipCount = 0;
+        for (const user of users) {
+          const stats = JSON.parse(await env.DATA_KV.get(`user_stats_${user}`) || '{"count":0}');
+          totalDownloads += stats.count;
+          if (await isUserVIP(env, user)) vipCount++;
+        }
+        const channelsForStats = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+        const isForceActive = await env.DATA_KV.get("force_join_enabled") !== "false";
+        const vipSystemEnabled = await env.DATA_KV.get("vip_system_enabled") !== "false";
+        const threshold = await env.DATA_KV.get("vip_referral_threshold") || "2";
+
+        const statsText = `📊 <b>آمار کامل سیستم</b>\n\n👥 کاربران: ${users.length}\n⭐️ کاربران VIP: ${vipCount}\n🚀 کدهای V2Ray: ${configs.length}\n⭐️ کدهای VIP: ${vipConfigs.length}\n🌀 فایل‌های NPV2: ${npv.length}\n📥 کل دانلودها: ${totalDownloads}\n📩 پیام‌های نخوانده: ${unread}\n\n🔘 عضویت اجباری: ${isForceActive ? "✅ فعال" : "❌ غیرفعال"}\n📢 کانال‌ها: ${channelsForStats.length > 0 ? channelsForStats.join(", ") : "هیچ"}\n⭐️ سیستم VIP: ${vipSystemEnabled ? "✅ فعال" : "❌ غیرفعال"}\n🎁 دعوت لازم برای VIP: ${threshold}\n\n📅 ${getTehranTime()}`;
+        await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: statsText, parse_mode: "HTML" });
+        return new Response("OK");
+      }
+
+      if (isAdmin && text === "📩 مشاهده پیام‌های کاربران") {
+        await sendMessagesPage(env, BOT_TOKEN, chatId, 0, MESSAGES_PER_PAGE);
+        return new Response("OK");
+      }
+
+    } catch (error) {
+      console.error("Error:", error);
+    }
+
+    return new Response("OK");
+  }
+};
+
+// ========== توابع VIP ==========
+
+async function isUserVIP(env, userId) {
+  const data = await env.DATA_KV.get(`vip_${userId}`);
+  return data === "true";
+}
+
+async function setVIP(env, userId, status) {
+  await env.DATA_KV.put(`vip_${userId}`, status ? "true" : "false");
+}
+
+async function getReferralData(env, userId) {
+  const data = JSON.parse(await env.DATA_KV.get(`referral_${userId}`) || '{"count":0,"invitees":[]}');
+  return data;
+}
+
+async function processReferral(env, BOT_TOKEN, inviterId, newUserId) {
+  const alreadyReferred = await env.DATA_KV.get(`referred_by_${newUserId}`);
+  if (alreadyReferred) return;
+
+  await env.DATA_KV.put(`referred_by_${newUserId}`, inviterId);
+
+  let referralData = await getReferralData(env, inviterId);
+  if (!referralData.invitees.includes(newUserId)) {
+    referralData.count++;
+    referralData.invitees.push(newUserId);
+    await env.DATA_KV.put(`referral_${inviterId}`, JSON.stringify(referralData));
+
+    const threshold = parseInt(await env.DATA_KV.get("vip_referral_threshold") || "2");
+    const vipSystemEnabled = await env.DATA_KV.get("vip_system_enabled") !== "false";
+
+    let notifyText = `🎉 یک نفر با لینک شما عضو شد!\n\n📨 دعوت‌های موفق: ${referralData.count} از ${threshold}`;
+
+    if (vipSystemEnabled && referralData.count >= threshold) {
+      const wasVip = await isUserVIP(env, inviterId);
+      if (!wasVip) {
+        await setVIP(env, inviterId, true);
+        notifyText += `\n\n⭐️ <b>تبریک! شما VIP شدید!</b>\nاز منو گزینه «⭐️ سرور VIP» را انتخاب کنید.`;
+      }
+    } else {
+      const remaining = threshold - referralData.count;
+      notifyText += `\n⏳ ${remaining} دعوت دیگر تا VIP`;
+    }
+
+    await sendTelegram(BOT_TOKEN, "sendMessage", {
+      chat_id: inviterId,
+      text: notifyText,
+      parse_mode: "HTML"
+    });
+  }
+}
+
+async function showVIPMenu(env, BOT_TOKEN, chatId) {
+  const vipEnabled = await env.DATA_KV.get("vip_system_enabled") !== "false";
+  const threshold = await env.DATA_KV.get("vip_referral_threshold") || "2";
+  const vipConfigs = JSON.parse(await env.DATA_KV.get("configs_vip") || "[]");
+
+  await sendTelegram(BOT_TOKEN, "sendMessage", {
+    chat_id: chatId,
+    text: `⭐️ <b>مدیریت سیستم VIP</b>\n\n📊 وضعیت: ${vipEnabled ? "✅ فعال" : "❌ غیرفعال"}\n🎁 دعوت لازم برای VIP: ${threshold} نفر\n📦 کانفیگ‌های VIP: ${vipConfigs.length} عدد`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: vipEnabled ? "❌ غیرفعال کردن VIP" : "✅ فعال کردن VIP", callback_data: "toggle_vip_system" }],
+        [{ text: "🔢 تغییر تعداد دعوت لازم", callback_data: "change_vip_threshold" }],
+        [{ text: "👤 مدیریت VIP کاربر", callback_data: "vip_manage_user" }],
+        [{ text: "➕ افزودن کانفیگ VIP", callback_data: "add_vip_config" }],
+        [{ text: "🗑 پاکسازی کانفیگ‌های VIP", callback_data: "clear_vip_configs" }],
+        [{ text: "🔙 بازگشت به پنل", callback_data: "back_to_admin_panel" }]
+      ]
+    }
+  });
+}
+
+// ========== توابع کمکی ==========
+
+async function sendMessagesPage(env, BOT_TOKEN, chatId, page, perPage) {
+  const messages = JSON.parse(await env.DATA_KV.get("admin_messages") || "[]");
+  if (messages.length === 0) {
+    await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "📭 هیچ پیامی وجود ندارد." });
+    return;
+  }
+  if (page === 0) {
+    const updated = messages.map(m => ({ ...m, read: true }));
+    await env.DATA_KV.put("admin_messages", JSON.stringify(updated));
+  }
+  const totalPages = Math.ceil(messages.length / perPage);
+  const start = page * perPage;
+  const pageMessages = messages.slice(start, start + perPage);
+  for (let i = 0; i < pageMessages.length; i++) {
+    const msgItem = pageMessages[i];
+    let msgText = `📩 <b>پیام ${start + i + 1} از ${messages.length}</b>\n\n`;
+    msgText += `👤 کاربر: <code>${msgItem.userId}</code>\n`;
+    if (msgItem.username) msgText += `🆔 @${msgItem.username}\n`;
+    if (msgItem.text) msgText += `📝 ${msgItem.text}\n`;
+    if (msgItem.hasMedia) msgText += `📎 دارای فایل/تصویر\n`;
+    msgText += `📅 ${msgItem.datePersian || new Date(msgItem.date).toLocaleString('fa-IR')}`;
+    await sendTelegram(BOT_TOKEN, "sendMessage", {
+      chat_id: chatId, text: msgText, parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "↩️ پاسخ به این کاربر", callback_data: `reply_msg_${msgItem.userId}` }]] }
+    });
+  }
+  if (totalPages > 1) {
+    const navButtons = [];
+    if (page > 0) navButtons.push({ text: "⬅️ قبلی", callback_data: `msgs_page_${page - 1}` });
+    navButtons.push({ text: `${page + 1} / ${totalPages}`, callback_data: "noop" });
+    if (page < totalPages - 1) navButtons.push({ text: "بعدی ➡️", callback_data: `msgs_page_${page + 1}` });
+    await sendTelegram(BOT_TOKEN, "sendMessage", {
+      chat_id: chatId, text: `📄 صفحه ${page + 1} از ${totalPages}`,
+      reply_markup: { inline_keyboard: [navButtons] }
+    });
+  }
+}
+
+async function clearAdminState(env, ADMIN_ID) {
+  await env.DATA_KV.delete(`admin_state_${ADMIN_ID}`);
+  await env.DATA_KV.delete(`reply_target_${ADMIN_ID}`);
+}
+
+async function sendAdminPanel(BOT_TOKEN, chatId) {
+  const keyboard = {
+    keyboard: [
+      [{ text: "➕ افزودن کد V2Ray" }, { text: "📁 افزودن فایل NPV2" }],
+      [{ text: "📊 آمار کامل سیستم" }, { text: "📩 مشاهده پیام‌های کاربران" }],
+      [{ text: "🔘 تنظیم عضویت اجباری" }, { text: "⭐️ مدیریت VIP" }],
+      [{ text: "📢 ارسال همگانی" }],
+      [{ text: "🗑 پاکسازی (تفکیک شده)" }, { text: "🏠 منوی اصلی" }]
+    ],
+    resize_keyboard: true
+  };
+  await sendTelegram(BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "🛠 پنل مدیریت", reply_markup: keyboard });
+}
+
+async function showForceJoinMenu(env, BOT_TOKEN, chatId) {
+  const currentChannels = JSON.parse(await env.DATA_KV.get("required_channels") || "[]");
+  const isEnabled = await env.DATA_KV.get("force_join_enabled") !== "false";
+  const channelsText = currentChannels.length === 0
+    ? "❌ هیچ کانالی تنظیم نشده"
+    : currentChannels.map((ch, idx) => `${idx + 1}. ${ch}`).join('\n');
+  await sendTelegram(BOT_TOKEN, "sendMessage", {
+    chat_id: chatId,
+    text: `🔘 <b>تنظیمات عضویت اجباری</b>\n\n📊 وضعیت: ${isEnabled ? "✅ فعال" : "❌ غیرفعال"}\n\n📢 <b>کانال‌های فعال:</b>\n${channelsText}\n\n⚠️ ربات باید در کانال‌ها ادمین باشد!`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "➕ افزودن کانال جدید", callback_data: "add_channel" }],
+        [{ text: "❌ حذف کانال", callback_data: "remove_channel" }],
+        [{ text: isEnabled ? "❌ غیرفعال کردن عضویت اجباری" : "✅ فعال کردن عضویت اجباری", callback_data: "toggle_force_join" }],
+        [{ text: "🔙 بازگشت به پنل", callback_data: "back_to_admin_panel" }]
+      ]
+    }
+  });
+}
+
+async function addUser(env, userId) {
+  let users = JSON.parse(await env.DATA_KV.get("users") || "[]");
+  if (!users.includes(userId)) {
+    users.push(userId);
+    await env.DATA_KV.put("users", JSON.stringify(users));
+    return true;
+  }
+  return false;
+}
+
+function isValidConfigFormat(configStr) {
+  const trimmed = configStr.trim();
+  if (trimmed.startsWith("vmess://")) {
+    try { Buffer.from(trimmed.replace("vmess://", ""), 'base64').toString('utf-8'); return true; }
+    catch { return false; }
+  }
+  if (trimmed.startsWith("vless://")) return trimmed.length > 50;
+  if (trimmed.startsWith("trojan://")) return trimmed.length > 50;
+  if (trimmed.startsWith("ss://")) return trimmed.length > 30;
+  return false;
+}
+
+async function sendTelegram(token, method, body) {
+  return fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+}
