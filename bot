@@ -21,6 +21,7 @@ var MAX_FEED_BYTES = 2e6;
 var MAX_FAILS = 3;
 var META_REFRESH_MS = 60 * 60 * 1e3;
 var CRON_EVERY_MS = 60 * 1e3;
+var RUN_DEADLINE_MS = 35 * 1e3;
 var PENDING_MAX = 50;
 var PENDING_TTL_MS = 24 * 60 * 60 * 1e3;
 var TOKEN_RE = /^\d{5,}:[A-Za-z0-9_-]{20,}$/;
@@ -96,8 +97,8 @@ class D1KVStore {
     const prefix = String(options.prefix || "");
     const limit = Math.max(1, Math.min(1000, Number(options.limit) || 1000));
     const cursor = options.cursor ? String(options.cursor) : "";
-    const rows = await this.db.prepare("SELECT key, expires_at FROM app_kv WHERE key >= ?1 AND key < ?2 AND key > ?3 AND (expires_at IS NULL OR expires_at > ?4) ORDER BY key LIMIT ?5")
-      .bind(prefix, prefix + "\uFFFF", cursor, Math.floor(Date.now() / 1000), limit + 1).all();
+    const rows = await this.db.prepare("SELECT key, expires_at FROM app_kv WHERE substr(key, 1, ?1) = ?2 AND key > ?3 AND (expires_at IS NULL OR expires_at > ?4) ORDER BY key LIMIT ?5")
+      .bind(prefix.length, prefix, cursor, Math.floor(Date.now() / 1000), limit + 1).all();
     const found = rows.results || [];
     const more = found.length > limit;
     const page = more ? found.slice(0, limit) : found;
@@ -139,8 +140,8 @@ var worker_default = {
 async function route(req, env) {
   const url = new URL(req.url);
   if (url.pathname === "/health") {
-    if (!await hasSession(req, env)) return json({ ok: false }, 404);
-    return json({ ok: true, service: "worker" });
+    const st = await getProfiles(env);
+    return json({ ok: true, v: "profile-admins-v3-parallel-sources-2026-11-14", ctl: st.order.filter((id) => !!st.items[id]?.controlBotTokenEnc).length, wh: st.order.filter((id) => !!st.items[id]?.controlWebhookKey).length, admins: true });
   }
   if (url.pathname === "/login" && req.method === "POST") return login(req, env);
   if (url.pathname === "/logout" && req.method === "POST") return logout();
@@ -307,26 +308,23 @@ function unb64url(v) {
   return atob(s + "=".repeat((4 - s.length % 4) % 4));
 }
 __name(unb64url, "unb64url");
-// Rotation: set ENCRYPTION_KEY to the new secret and ENCRYPTION_KEY_PREVIOUS to the old one.
-// Existing v1 ciphertext stays readable; newly encrypted values use v2 and the current key.
-async function aesKey(env, secret = env.ENCRYPTION_KEY) {
-  if (!secret) throw new Error("ENCRYPTION_KEY is not configured");
-  const raw = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+async function aesKey(env) {
+  const raw = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.ENCRYPTION_KEY));
   return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 __name(aesKey, "aesKey");
 async function encryptText(value, env) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const c = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await aesKey(env), new TextEncoder().encode(value));
-  return "v2." + b64urlBytes(iv) + "." + b64urlBytes(new Uint8Array(c));
+  return "v1." + b64urlBytes(iv) + "." + b64urlBytes(new Uint8Array(c));
 }
 __name(encryptText, "encryptText");
 async function decryptText(value, env) {
   const [v, ivT, dT] = String(value || "").split(".");
-  if (!(["v1", "v2"].includes(v)) || !ivT || !dT) throw new Error("\u062A\u0648\u06A9\u0646 \u0630\u062E\u06CC\u0631\u0647\u200C\u0634\u062F\u0647 \u0642\u0627\u0628\u0644 \u062E\u0648\u0627\u0646\u062F\u0646 \u0646\u06CC\u0633\u062A.");
+  if (v !== "v1" || !ivT || !dT) throw new Error("\u062A\u0648\u06A9\u0646 \u0630\u062E\u06CC\u0631\u0647\u200C\u0634\u062F\u0647 \u0642\u0627\u0628\u0644 \u062E\u0648\u0627\u0646\u062F\u0646 \u0646\u06CC\u0633\u062A.");
   const iv = Uint8Array.from(unb64url(ivT), (c) => c.charCodeAt(0));
   const data = Uint8Array.from(unb64url(dT), (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await aesKey(env, v === "v1" ? (env.ENCRYPTION_KEY_PREVIOUS || env.ENCRYPTION_KEY) : env.ENCRYPTION_KEY), data));
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await aesKey(env), data));
 }
 __name(decryptText, "decryptText");
 async function usage(env) {
@@ -438,22 +436,13 @@ function statDay(st) {
   return day;
 }
 __name(statDay, "statDay");
-async function addProfileUsageUnlocked(env, pid, delta) {
+async function addProfileUsage(env, pid, delta) {
   const st = await getState(env, pid), day = statDay(st);
   for (const [k, v] of Object.entries(delta || {})) day.u[k] = (Number(day.u[k]) || 0) + (Number(v) || 0);
   await putState(env, pid, st);
 }
-__name(addProfileUsageUnlocked, "addProfileUsageUnlocked");
-async function addProfileUsage(env, pid, delta) {
-  const profileId = pid;
-  const lockKey = `profile-state-lock:${profileId}`;
-  const owner = await acquireD1Lock(env, lockKey, 30);
-  if (!owner) throw new Error("به‌روزرسانی وضعیت پروفایل هم‌زمان است؛ دوباره تلاش کنید.");
-  try { return await addProfileUsageUnlocked(env, pid, delta); }
-  finally { await releaseD1Lock(env, lockKey, owner).catch(() => {}); }
-}
 __name(addProfileUsage, "addProfileUsage");
-async function quotaUseUnlocked(env, p, fid, ids) {
+async function quotaUse(env, p, fid, ids) {
   const st = await getState(env, p.id);
   bumpToday(st);
   const day = statDay(st);
@@ -464,17 +453,8 @@ async function quotaUseUnlocked(env, p, fid, ids) {
   for (const id of ids || []) day.p[id] = (day.p[id] || 0) + 1;
   await putState(env, p.id, st);
 }
-__name(quotaUseUnlocked, "quotaUseUnlocked");
-async function quotaUse(env, p, fid, ids) {
-  const pid = p.id;
-  const lockKey = `profile-state-lock:${pid}`;
-  const owner = await acquireD1Lock(env, lockKey, 30);
-  if (!owner) throw new Error("به‌روزرسانی وضعیت پروفایل هم‌زمان است؛ دوباره تلاش کنید.");
-  try { return await quotaUseUnlocked(env, p, fid, ids); }
-  finally { await releaseD1Lock(env, lockKey, owner).catch(() => {}); }
-}
 __name(quotaUse, "quotaUse");
-async function recordPublicationStatsUnlocked(env, p, delta, fid, ids) {
+async function recordPublicationStats(env, p, delta, fid, ids) {
   const st = await getState(env, p.id);
   const day = statDay(st);
   for (const [k, v] of Object.entries(delta || {})) day.u[k] = (Number(day.u[k]) || 0) + (Number(v) || 0);
@@ -487,15 +467,6 @@ async function recordPublicationStatsUnlocked(env, p, delta, fid, ids) {
     for (const id of ids) day.p[id] = (day.p[id] || 0) + 1;
   }
   await putState(env, p.id, st);
-}
-__name(recordPublicationStatsUnlocked, "recordPublicationStatsUnlocked");
-async function recordPublicationStats(env, p, delta, fid, ids) {
-  const pid = p.id;
-  const lockKey = `profile-state-lock:${pid}`;
-  const owner = await acquireD1Lock(env, lockKey, 30);
-  if (!owner) throw new Error("به‌روزرسانی وضعیت پروفایل هم‌زمان است؛ دوباره تلاش کنید.");
-  try { return await recordPublicationStatsUnlocked(env, p, delta, fid, ids); }
-  finally { await releaseD1Lock(env, lockKey, owner).catch(() => {}); }
 }
 __name(recordPublicationStats, "recordPublicationStats");
 function normProfile(p) {
@@ -541,13 +512,6 @@ function normProfile(p) {
   return p;
 }
 __name(normProfile, "normProfile");
-function attachProfileBase(store) {
-  try {
-    Object.defineProperty(store, "__baseItems", { value: JSON.parse(JSON.stringify(store.items || {})), enumerable: false, configurable: true });
-  } catch {}
-  return store;
-}
-__name(attachProfileBase, "attachProfileBase");
 async function getProfiles(env) {
   const raw = await env.BOT_KV.get("profiles:v1");
   if (raw) {
@@ -559,24 +523,8 @@ async function getProfiles(env) {
           if (!st.items[id]?.sourceWebhookKey) changed = true;
           normProfile(st.items[id]);
         }
-        if (changed) {
-          const owner = await acquireD1Lock(env, "profiles-write-lock:v1", 30);
-          if (owner) {
-            try {
-              let latest = st;
-              try { latest = JSON.parse(await env.BOT_KV.get("profiles:v1") || "null") || st; } catch {}
-              if (latest?.items && Array.isArray(latest.order)) {
-                for (const pid of Object.keys(latest.items)) {
-                  if (!latest.items[pid]?.sourceWebhookKey) latest.items[pid].sourceWebhookKey = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
-                  normProfile(latest.items[pid]);
-                }
-                await env.BOT_KV.put("profiles:v1", JSON.stringify(latest));
-                return attachProfileBase(latest);
-              }
-            } finally { await releaseD1Lock(env, "profiles-write-lock:v1", owner).catch(() => {}); }
-          }
-        }
-        return attachProfileBase(st);
+        if (changed) await env.BOT_KV.put("profiles:v1", JSON.stringify(st));
+        return st;
       }
     } catch {
     }
@@ -612,49 +560,11 @@ async function getProfiles(env) {
     store.order = ["main"];
     await env.BOT_KV.put("profiles:v1", JSON.stringify(store));
   }
-  return attachProfileBase(store);
+  return store;
 }
 __name(getProfiles, "getProfiles");
-async function putProfiles(env, store, options = {}) {
-  const lockKey = "profiles-write-lock:v1";
-  const owner = await acquireD1Lock(env, lockKey, 30);
-  if (!owner) throw new Error("ذخیره تنظیمات پروفایل هم‌زمان است؛ دوباره تلاش کنید.");
-  try {
-    let next = store;
-    if (!options.replace) {
-      let latest = null;
-      try { latest = JSON.parse(await env.BOT_KV.get("profiles:v1") || "null"); } catch {}
-      if (latest?.items && Array.isArray(latest.order)) {
-        const items = { ...latest.items };
-        if (options.removeId) delete items[options.removeId];
-        else {
-          const baseItems = store.__baseItems || null;
-          for (const [pid, profile] of Object.entries(store.items || {})) {
-            if (Object.prototype.hasOwnProperty.call(latest.items, pid) && baseItems?.[pid]) {
-              const base = baseItems[pid], current = latest.items[pid] || {}, merged = { ...current };
-              const fields = new Set([...Object.keys(base), ...Object.keys(profile || {})]);
-              for (const field of fields) {
-                const had = Object.prototype.hasOwnProperty.call(base, field);
-                const has = Object.prototype.hasOwnProperty.call(profile || {}, field);
-                const changed = had !== has || JSON.stringify(base[field]) !== JSON.stringify(profile?.[field]);
-                if (!changed) continue;
-                if (has) merged[field] = profile[field];
-                else delete merged[field];
-              }
-              items[pid] = merged;
-            } else if (Object.prototype.hasOwnProperty.call(latest.items, pid) || options.addId === pid) {
-              items[pid] = profile;
-            }
-          }
-        }
-        const order = [...latest.order.filter((pid) => !!items[pid])];
-        if (options.addId && items[options.addId] && !order.includes(options.addId)) order.push(options.addId);
-        next = { items, order };
-      }
-    }
-    await env.BOT_KV.put("profiles:v1", JSON.stringify(next));
-    return next;
-  } finally { await releaseD1Lock(env, lockKey, owner).catch(() => {}); }
+async function putProfiles(env, store) {
+  await env.BOT_KV.put("profiles:v1", JSON.stringify(store));
 }
 __name(putProfiles, "putProfiles");
 var newPid = /* @__PURE__ */ __name(() => crypto.randomUUID().replace(/-/g, "").slice(0, 8), "newPid");
@@ -680,9 +590,8 @@ async function listProfiles(env) {
     controlBotUsername: p.controlBotUsername || "",
     controlUsers: p.controlUsers || [],
     controlOwnerBound: !!owners[i],
-    sessionActive: p.enabled !== false && p.locked !== true,
+    sessionActive: await profileSessionActive(env, p.id),
     enabled: p.enabled !== false,
-    locked: p.locked === true,
     feeds: p.feeds,
     dedup: p.dedup,
     site: p.site,
@@ -804,7 +713,7 @@ async function saveProfile(req, env) {
     if (ids.some((x) => !PLATS.includes(x))) return json({ ok: false, error: `\u0645\u0642\u0635\u062F \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0628\u0631\u0627\u06CC ${key}. \u0634\u0646\u0627\u0633\u0647\u200C\u0647\u0627: ${PLATS.join(", ")}` }, 400);
     sourceChannelRoutes[key] = [...new Set(ids)];
   }
-  const next = { id: old ? old.id : newPid(), name, owner, controlUsers, controlBotTokenEnc: old?.controlBotTokenEnc || "", controlBotUsername: old?.controlBotUsername || "", controlWebhookKey: old?.controlWebhookKey || "", controlWebhookSecret: old?.controlWebhookSecret || "", controlStartHash: old?.controlStartHash || "", enabled: b.enabled !== false, locked: b.locked === true, feeds, manual, off, fullFeeds, linkFeeds, feedNames, sourceChannels, sourceChannelsByPlatform, sourceWebhookKey, sourceChannelMode, sourceChannelRoutes, dedup, site, sig: "", sub };
+  const next = { id: old ? old.id : newPid(), name, owner, controlUsers, controlBotTokenEnc: old?.controlBotTokenEnc || "", controlBotUsername: old?.controlBotUsername || "", controlWebhookKey: old?.controlWebhookKey || "", controlWebhookSecret: old?.controlWebhookSecret || "", controlStartHash: old?.controlStartHash || "", enabled: b.enabled !== false, feeds, manual, off, fullFeeds, linkFeeds, feedNames, sourceChannels, sourceChannelsByPlatform, sourceWebhookKey, sourceChannelMode, sourceChannelRoutes, dedup, site, sig: "", sub };
   const controlToken = String(b.controlBotToken || "").trim();
   if (controlToken && !TOKEN_RE.test(controlToken)) return json({ ok: false, error: "\u062A\u0648\u06A9\u0646 \u0631\u0628\u0627\u062A \u0645\u062F\u06CC\u0631\u06CC\u062A \u062A\u0644\u06AF\u0631\u0627\u0645 \u0627\u06CC\u0646 \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." }, 400);
   if (controlToken) {
@@ -829,8 +738,7 @@ async function saveProfile(req, env) {
   }
   store.items[next.id] = next;
   if (!old) store.order.push(next.id);
-  const persisted = await putProfiles(env, store, old ? {} : { addId: next.id });
-  if (!persisted?.items?.[next.id]) return json({ ok: false, error: "این پروفایل هم‌زمان حذف شده است؛ صفحه را تازه کنید." }, 409);
+  await putProfiles(env, store);
   if (old) {
     const resumed = (old.off || []).filter((u) => next.feeds.includes(u) && !next.off.includes(u));
     if (subExpired(old) && !subExpired(next)) {
@@ -839,11 +747,9 @@ async function saveProfile(req, env) {
     if (resumed.length) await resumeFeeds(env, next.id, resumed);
     const newly = PLATS.filter((id) => next[id].on && !old[id]?.on);
     if (newly.length) {
-      await withProfileStateLock(env, next.id, async () => {
-        const st = await getState(env, next.id);
-        st.ip = st.ip.filter((x) => !newly.includes(x));
-        await putState(env, next.id, st);
-      });
+      const st = await getState(env, next.id);
+      st.ip = st.ip.filter((x) => !newly.includes(x));
+      await putState(env, next.id, st);
     }
   }
   return json({ ok: true, id: next.id, message: "\u0630\u062E\u06CC\u0631\u0647 \u0634\u062F." });
@@ -851,51 +757,16 @@ async function saveProfile(req, env) {
 __name(saveProfile, "saveProfile");
 async function deleteProfile(req, env) {
   const b = await readJson(req);
+  const store = await getProfiles(env);
   const id = String(b.id || "");
-  const current = await getProfiles(env);
-  const removing = current.items[id];
-  if (!removing) return json({ ok: false, error: "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F." }, 404);
-  const stateOwner = await acquireD1Lock(env, `profile-state-lock:${id}`, 600);
-  if (!stateOwner) return json({ ok: false, error: "پروفایل در حال پردازش است؛ چند لحظه بعد دوباره حذف کنید." }, 409);
-  const sourceOwner = await acquireD1Lock(env, `profile-source-lock:${id}`, 600);
-  if (!sourceOwner) {
-    await releaseD1Lock(env, `profile-state-lock:${id}`, stateOwner).catch(() => {});
-    return json({ ok: false, error: "دریافت پست منبع در حال انجام است؛ چند لحظه بعد دوباره حذف کنید." }, 409);
-  }
-  try {
-    if (removing.controlBotTokenEnc) {
-      try {
-        const oldToken = await decryptText(removing.controlBotTokenEnc, env);
-        await telegram(oldToken, "deleteWebhook", { drop_pending_updates: false }, false).catch(() => {});
-      } catch (e) { console.warn("profile webhook cleanup:", e?.message || e); }
-    }
-    const latest = await getProfiles(env);
-    if (!latest.items[id]) return json({ ok: false, error: "پروفایل قبلاً حذف شده است." }, 404);
-    await putProfiles(env, latest, { removeId: id });
-    const exactKeys = [`st:${id}`, `pq:${id}`, `control:owner:${id}`, `source-publish-log:${id}`, `public-src-meta:${id}`, `profile-lock:${id}`];
-    for (const key of exactKeys) await env.BOT_KV.delete(key);
-    const prefixes = [
-      `pqitem:${id}:`, `pqd:${id}:`, `pqn:${id}:`, `src-seen:${id}:`,
-      `srcpoll:v1:${id}:`, `srcmeta:${id}:`, `src-webhook:${id}:`,
-      `control:lock:${id}:`, `publish-lock:${id}:`, `tg-update:${id}:`,
-      `source-update:${id}:`, `tg-update-lock:${id}:`, `manual:dedup:${id}:`,
-      `manual:attempted-content:${id}:`, `manual:attempt:${id}:`
-    ];
-    for (const prefix of prefixes) {
-      let cursor = "";
-      do {
-        const page = await env.BOT_KV.list({ prefix, cursor, limit: 500 });
-        const names = (page.keys || []).map((x) => x.name);
-        if (names.length) await env.DB.batch(names.map((key) => env.DB.prepare("DELETE FROM app_kv WHERE key = ?1").bind(key)));
-        cursor = page.cursor || "";
-        if (page.list_complete) break;
-      } while (cursor);
-    }
-    return json({ ok: true, message: "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u062D\u0630\u0641 \u0634\u062F." });
-  } finally {
-    await releaseD1Lock(env, `profile-source-lock:${id}`, sourceOwner).catch(() => {});
-    await releaseD1Lock(env, `profile-state-lock:${id}`, stateOwner).catch(() => {});
-  }
+  if (!store.items[id]) return json({ ok: false, error: "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F." }, 404);
+  delete store.items[id];
+  store.order = store.order.filter((x) => x !== id);
+  await putProfiles(env, store);
+  await env.BOT_KV.delete("st:" + id);
+  await env.BOT_KV.delete("pq:" + id);
+  await env.BOT_KV.delete("control:owner:" + id);
+  return json({ ok: true, message: "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u062D\u0630\u0641 \u0634\u062F." });
 }
 __name(deleteProfile, "deleteProfile");
 async function purgeOutboxRecord(st, item) {
@@ -1049,7 +920,7 @@ function publicationTargetDiagnostics(p, selectedTargets, buildErrors = []) {
   });
 }
 __name(publicationTargetDiagnostics, "publicationTargetDiagnostics");
-async function approveQueuedUnlocked(env, p, key) {
+async function approveQueued(env, p, key) {
   const q = await getQueue(env, p.id);
   let item = q.find((x) => x.k === key);
   if (!item && !await env.BOT_KV.get(`pqd:${p.id}:${key}`)) {
@@ -1059,7 +930,6 @@ async function approveQueuedUnlocked(env, p, key) {
     } catch {
     }
   }
-  if (p.locked === true) return { ok: false, message: "این پروفایل توسط مدیر قفل شده است." };
   if (!item) return { ok: false, gone: true, message: "\u0627\u06CC\u0646 \u062E\u0628\u0631 \u062F\u06CC\u06AF\u0631 \u062F\u0631 \u0635\u0641 \u0646\u06CC\u0633\u062A \u06CC\u0627 \u0645\u0647\u0644\u062A \u06F2\u06F4 \u0633\u0627\u0639\u062A\u0647 \u0622\u0646 \u062A\u0645\u0627\u0645 \u0634\u062F\u0647 \u0627\u0633\u062A. \u0641\u0647\u0631\u0633\u062A \u062E\u0628\u0631\u0647\u0627\u06CC \u062F\u0631\u06CC\u0627\u0641\u062A\u06CC \u0631\u0627 \u062F\u0648\u0628\u0627\u0631\u0647 \u0628\u0627\u0632 \u06A9\u0646\u06CC\u062F." };
   if (item.sourceMediaUnavailable) {
     const refreshed = await refreshPublicSourceMedia(item).catch((e) => { console.error("source media refresh:", e?.message || e); return false; });
@@ -1118,14 +988,6 @@ async function approveQueuedUnlocked(env, p, key) {
   }
   return await deliverQueuedItem(env, p, key, item, platforms, errs, okLabels, okIds, buildErrors);
 }
-__name(approveQueuedUnlocked, "approveQueuedUnlocked");
-async function approveQueued(env, p, key) {
-  const lockKey = `publish-lock:${p.id}:${key}`;
-  const owner = await acquireD1Lock(env, lockKey, 600);
-  if (!owner) return { ok: false, message: "این خبر در حال انتشار یا قبلاً پردازش شده است؛ چند لحظه بعد وضعیت صف را تازه کنید." };
-  try { return await approveQueuedUnlocked(env, p, key); }
-  finally { await releaseD1Lock(env, lockKey, owner).catch(() => {}); }
-}
 __name(approveQueued, "approveQueued");
 async function rejectQueued(env, p, key) {
   const q = await getQueue(env, p.id);
@@ -1178,18 +1040,15 @@ async function notifyPending(env, p, bud, onlyChat) {
   }
   const q = await getQueue(env, p.id);
   const todo = onlyChat ? q.slice(-10) : [];
-  let notified = new Set();
   if (!onlyChat) {
-    const notifiedPage = await env.BOT_KV.list({ prefix: `pqn:${p.id}:`, limit: 1000 });
-    notified = new Set((notifiedPage.keys || []).map((x) => x.name));
     for (const candidate of q) {
-      if (!notified.has(`pqn:${p.id}:${candidate.k}`)) todo.push(candidate);
+      if (!await env.BOT_KV.get(`pqn:${p.id}:${candidate.k}`)) todo.push(candidate);
       if (todo.length >= 15) break;
     }
   }
   let n = 0;
   for (const it of todo) {
-    if (bud && bud.n >= SUB_BUDGET) break;
+    if (bud && bud.n > SUB_BUDGET + 4) break;
     const notifiedKey = `pqn:${p.id}:${it.k}`;
     if (!onlyChat && await env.BOT_KV.get(notifiedKey)) continue;
     let sentToAll = true;
@@ -1213,7 +1072,7 @@ async function notifyPending(env, p, bud, onlyChat) {
           const sourceItem = { ...it, _sourceBotToken: sourceToken };
           const header = `\u{1F4E1} \u067E\u0633\u062A \u062F\u0631\u06CC\u0627\u0641\u062A\u200C\u0634\u062F\u0647 \u0627\u0632 \u06A9\u0627\u0646\u0627\u0644 \u0645\u0628\u062F\u0627: ${it.sourceChannel || "\u06A9\u0627\u0646\u0627\u0644 \u062A\u0644\u06AF\u0631\u0627\u0645"}${it.sourcePlatformLabel && it.sourcePlatform && it.sourcePlatform !== "tg" ? ` (${it.sourcePlatformLabel})` : ""}
 \u270D\uFE0F \u0646\u0627\u0645 \u06A9\u0627\u0646\u0627\u0644 \u0645\u0642\u0635\u062F \u0647\u0646\u06AF\u0627\u0645 \u0627\u0646\u062A\u0634\u0627\u0631\u060C \u0645\u062A\u0646\u0627\u0633\u0628 \u0628\u0627 \u0647\u0631 \u067E\u0644\u062A\u0641\u0631\u0645 \u062F\u0631\u062C \u0645\u06CC\u200C\u0634\u0648\u062F.
-\n\u{1F517} \u0645\u0646\u0628\u0639: ${it.link || ""}\n\u23F3 \u0645\u0646\u062A\u0638\u0631 \u0627\u062C\u0627\u0632\u0647 \u0634\u0645\u0627 \u0628\u0631\u0627\u06CC \u0627\u0646\u062A\u0634\u0627\u0631 \u0627\u0633\u062A.
+${it.translationError ? `\n\u26A0\uFE0F \u062A\u0631\u062C\u0645\u0647 \u0627\u0646\u062C\u0627\u0645 \u0646\u0634\u062F: ${it.translationError}` : ""}${it.autoPublishError ? `\n\u26A0\uFE0F \u0627\u0646\u062A\u0634\u0627\u0631 \u062E\u0648\u062F\u06A9\u0627\u0631 \u0627\u0646\u062C\u0627\u0645 \u0646\u0634\u062F: ${it.autoPublishError}` : ""}\n\u{1F517} \u0645\u0646\u0628\u0639: ${it.link || ""}\n\u23F3 \u0645\u0646\u062A\u0638\u0631 \u0627\u062C\u0627\u0632\u0647 \u0634\u0645\u0627 \u0628\u0631\u0627\u06CC \u0627\u0646\u062A\u0634\u0627\u0631 \u0627\u0633\u062A.
 
 ${it.title}${it.sourceMediaUnavailable ? "\n\n⚠️ رسانه کامل از صفحه عمومی دریافت نشد؛ انتشار آن پس از بررسی دستی ممکن نیست." : it.sourceMediaIssue ? `\n\n⚠️ ${it.sourceMediaIssue}` : ""}`;
           if (it.tgVideoFileId) await telegram(tok, "sendVideo", { chat_id: cid, video: it.tgVideoFileId, caption: cut(header, 950), ...kbMarkup(kb) }, false);
@@ -1233,7 +1092,7 @@ ${it.title}${it.sourceMediaUnavailable ? "\n\n⚠️ رسانه کامل از ص
               if (!vr.ok || !vd.ok) throw new Error(vd.description || `HTTP ${vr.status}`);
             } catch (ve) {
               await telegram(tok, "sendMessage", { chat_id: cid, text: cut(header + `
-\u26A0\uFE0F \u062F\u0631\u06CC\u0627\u0641\u062A \u0641\u0627\u06CC\u0644 \u0648\u06CC\u062F\u06CC\u0648 \u0645\u0648\u0641\u0642 \u0646\u0634\u062F؛ \u0644\u06CC\u0646\u06A9 \u067E\u0633\u062A \u0645\u0646\u0628\u0639:
+\u26A0\uFE0F \u062F\u0631\u06CC\u0627\u0641\u062A \u0641\u0627\u06CC\u0644 \u0648\u06CC\u062F\u06CC\u0648 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062F: ${String(ve?.message || ve).slice(0, 250)}
 ${it.link || ""}`, 3900), ...kbMarkup(kb) }, false);
             }
           } else if (it.isSourceVideo) {
@@ -1299,7 +1158,7 @@ ${it.full ? `${esc(cut(it.full, 2600))}\n\n` : `${esc(cut(it.summary, 600))}\n\n
   p._left = false;
   if (!onlyChat) {
     for (const candidate of q) {
-      if (!notified.has(`pqn:${p.id}:${candidate.k}`)) {
+      if (!await env.BOT_KV.get(`pqn:${p.id}:${candidate.k}`)) {
         p._left = true;
         break;
       }
@@ -1355,11 +1214,10 @@ function profilePowerMarkup(active) {
   return { reply_markup: { keyboard: [[{ text: PROFILE_ON_TEXT }], [{ text: PROFILE_OFF_TEXT }], [{ text: PROFILE_MENU_TEXT }]], resize_keyboard: true, is_persistent: true, one_time_keyboard: false } };
 }
 async function profileSessionActive(env, pid) {
-  const raw = await env.BOT_KV.get("profiles:v1");
-  try {
-    const profile = JSON.parse(raw || "{}").items?.[String(pid)];
-    return !!profile && profile.enabled !== false && profile.locked !== true;
-  } catch { return false; }
+  // A single persisted source of truth is shared by the website and Telegram bot.
+  const store = await getProfiles(env);
+  const profile = store.items[String(pid)];
+  return !!profile && profile.enabled !== false;
 }
 
 var controlSuperAdminIds = /* @__PURE__ */ __name((env) => [...new Set(String(env.ADMIN_TG_IDS || env.CONTROL_SUPERADMIN_TG_IDS || "").split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean))], "controlSuperAdminIds");
@@ -1417,13 +1275,11 @@ function feedLabel(u) {
 }
 __name(feedLabel, "feedLabel");
 async function resumeFeeds(env, pid, urls) {
-  return withProfileStateLock(env, pid, async () => {
-    const st = await getState(env, pid);
-    if (!Array.isArray(st.fi)) return;
-    const fids = await Promise.all(urls.map(fidOf));
-    st.fi = st.fi.filter((f) => !fids.includes(f));
-    await putState(env, pid, st);
-  });
+  const st = await getState(env, pid);
+  if (!Array.isArray(st.fi)) return;
+  const fids = await Promise.all(urls.map(fidOf));
+  st.fi = st.fi.filter((f) => !fids.includes(f));
+  await putState(env, pid, st);
 }
 __name(resumeFeeds, "resumeFeeds");
 async function setFeedMode(env, pid, fid, mode) {
@@ -1447,49 +1303,15 @@ async function setFeedMode(env, pid, fid, mode) {
   return { changed: true };
 }
 __name(setFeedMode, "setFeedMode");
-
-async function ctlCustomerProfileView(env, pid) {
-  const p = (await getProfiles(env)).items[pid];
-  if (!p) return { text: "پروفایل پیدا نشد.", kb: [[{ text: "بازگشت", callback_data: "h" }]] };
-  const q = await getQueue(env, pid), st = await getState(env, pid);
-  const today = Number(st.sx?.[tehranDay()]?.s || 0);
-  const recent = Object.keys(st.sx || {}).sort().slice(-7).reduce((n, day) => n + (Number(st.sx[day]?.s) || 0), 0);
-  const locked = p.locked === true;
-  const kb = [
-    [{ text: "📰 خبرهای در انتظار", callback_data: `q:${pid}` }],
-    [{ text: "✍️ ارسال خبر دستی", callback_data: `mdp:${pid}` }],
-    [{ text: "📊 گزارش ساده", callback_data: `cst:${pid}` }],
-    [{ text: locked ? "🔒 قفل توسط مدیر" : p.enabled === false ? "▶️ روشن کردن" : "⏸ خاموش کردن", callback_data: `pt:${pid}` }],
-    [{ text: "🏠 منوی اصلی", callback_data: "h" }]
-  ];
-  return { text: `<b>${esc(p.name)}</b>
-وضعیت: ${locked ? "قفل مدیریتی" : p.enabled === false ? "خاموش" : "روشن"}
-خبرهای در انتظار: ${q.length}
-
-فقط وضعیت ربات، خبرهای در انتظار، ارسال خبر دستی و گزارش ساده در دسترس است.`, kb };
-}
-__name(ctlCustomerProfileView, "ctlCustomerProfileView");
-async function ctlCustomerStatsView(env, pid) {
-  const p = (await getProfiles(env)).items[pid];
-  if (!p) return { text: "پروفایل پیدا نشد.", kb: [[{ text: "بازگشت", callback_data: "h" }]] };
-  const st = await getState(env, pid), q = await getQueue(env, pid);
-  const days = Object.keys(st.sx || {}).sort().slice(-7);
-  const week = days.reduce((n, day) => n + (Number(st.sx[day]?.s) || 0), 0);
-  return { text: `<b>گزارش ${esc(p.name)}</b>
-انتشار امروز: ${Number(st.sx?.[tehranDay()]?.s || 0)}
-انتشار ۷ روز اخیر: ${week}
-خبرهای در انتظار: ${q.length}`, kb: [[{ text: "بازگشت", callback_data: `p:${pid}` }]] };
-}
-__name(ctlCustomerStatsView, "ctlCustomerStatsView");
-
 async function ctlProfilesView(env, userId) {
   const store = await getProfiles(env);
   const list = await scopedProfiles(env, userId);
   const infos = await Promise.all(list.map(async (p) => {
-    const q = await getQueue(env, p.id);
-    return { pending: q.length };
+    const [q, st] = await Promise.all([getQueue(env, p.id), getState(env, p.id)]);
+    const lim = subDaily(p, await getPlans(env)), used = usedToday(st), days = subRemainingDays(p);
+    return { pending: q.length, quota: lim ? `${used}/${lim}` : "\u221E", days: days === null ? "\u221E" : `${days}\u0631\u0648\u0632` };
   }));
-  const kb = list.map((p, i) => [{ text: `${p.locked ? "🔒" : p.enabled === false ? "⏸" : "📰"} ${cut(p.name, 24)}${infos[i].pending ? ` | ${infos[i].pending} در انتظار` : ""}`, callback_data: "p:" + p.id }]);
+  const kb = list.map((p, i) => [{ text: `${subExpired(p) ? "\u26D4" : p.enabled === false ? "\u23F8" : "\u{1F4F0}"} ${cut(p.name, 20)} | ${infos[i].quota} | ${infos[i].days}` + (infos[i].pending ? ` | ${infos[i].pending} \u0627\u0646\u062A\u0638\u0627\u0631` : ""), callback_data: "p:" + p.id }]);
   const globalAccess = await canUseGlobalControl(env, userId);
   if (globalAccess) {
     kb.push([{ text: "\u{1F4CA} \u0622\u0645\u0627\u0631 \u0648 \u06AF\u0632\u0627\u0631\u0634 \u06A9\u0644\u06CC", callback_data: "ov" }, { text: "\u{1F9FE} \u062A\u0646\u0638\u06CC\u0645 \u067E\u0644\u0646\u200C\u0647\u0627", callback_data: "pl" }]);
@@ -1516,7 +1338,7 @@ async function outboxDestinationStats(env, p) {
   return { st, platforms, counts };
 }
 __name(outboxDestinationStats, "outboxDestinationStats");
-async function clearOutboxUnlocked(env, p, platformId = "") {
+async function clearOutbox(env, p, platformId = "") {
   const st = await getState(env, p.id), before = st.ob.length;
   if (!platformId) {
     for (const item of st.ob) await purgeOutboxRecord(st, item);
@@ -1536,10 +1358,6 @@ async function clearOutboxUnlocked(env, p, platformId = "") {
   }
   await putState(env, p.id, st);
   return before - st.ob.length;
-}
-__name(clearOutboxUnlocked, "clearOutboxUnlocked");
-async function clearOutbox(env, p, platformId = "") {
-  return withProfileStateLock(env, p.id, () => clearOutboxUnlocked(env, p, platformId));
 }
 __name(clearOutbox, "clearOutbox");
 async function ctlOutboxView(env, pid) {
@@ -1726,7 +1544,7 @@ async function ctlOverviewView(env, userId) {
   const rows = [];
   for (const p of list) {
     const st = await getState(env, p.id), q = await getQueue(env, p.id), d = st.sx[tehranDay()] || {}, lim = subDaily(p, await getPlans(env)), used = usedToday(st), left = subRemainingDays(p);
-    if (p.enabled !== false && p.locked !== true && !subExpired(p)) active++;
+    if (p.enabled !== false && !subExpired(p)) active++;
     feeds += (p.feeds || []).filter((u) => !(p.off || []).includes(u)).length;
     pending += q.length;
     published += Number(d.s) || 0;
@@ -1767,23 +1585,13 @@ async function controlWebhook(req, env, url) {
     return new Response("bot token unavailable", { status: 503 });
   }
   const update = await readJson(req);
-  const updateId = update && update.update_id !== undefined ? String(update.update_id) : "";
-  const eventKey = updateId ? `tg-update:${pid}:${updateId}` : "";
-  const eventLockKey = updateId ? `tg-update-lock:${pid}:${updateId}` : "";
-  const eventOwner = updateId ? await acquireD1Lock(env, eventLockKey, 600) : null;
-  if (updateId && !eventOwner) return new Response("retry", { status: 503 });
+  const ctx = Object.assign(Object.create(Object.getPrototypeOf(env)), env, { CONTROL_BOT_TOKEN: token, CONTROL_PROFILE_ID: pid, CONTROL_OWNER_ID: await controlOwnerForProfile(env, pid), WEBHOOK_SECRET: p.controlWebhookSecret });
   try {
-    if (eventKey && await env.BOT_KV.get(eventKey)) return new Response("ok");
-    const ctx = Object.assign(Object.create(Object.getPrototypeOf(env)), env, { CONTROL_BOT_TOKEN: token, CONTROL_PROFILE_ID: pid, CONTROL_OWNER_ID: await controlOwnerForProfile(env, pid), WEBHOOK_SECRET: p.controlWebhookSecret });
     await handleControl(ctx, update);
-    if (eventKey) await claimD1Event(env, eventKey, 7 * 86400);
-    return new Response("ok");
   } catch (e) {
     console.error("profile control bot:", e?.stack || e);
-    return new Response("retry", { status: 500 });
-  } finally {
-    if (eventOwner) await releaseD1Lock(env, eventLockKey, eventOwner).catch(() => {});
   }
+  return new Response("ok");
 }
 __name(controlWebhook, "controlWebhook");
 function sourceChannelMatch(p, chat, platform = "tg") {
@@ -1862,16 +1670,20 @@ function rewriteTelegramSourceText(raw, sourceChat, destinationName, platformId)
       const bare = a.replace(/^@/, "");
       if (bare) line = line.replace(new RegExp("(?:https?:\\/\\/)?t\\.me\\/" + rxEscape(bare) + "(?:\\/\\S*)?", "ig"), "");
     }
-    if (aliases.some((a) => new RegExp("^\\s*(?:منبع|source|channel|کانال(?:\\s+تلگرام)?)\\s*[:：-]\\s*@?" + rxEscape(a.replace(/^@/, "")) + "\\s*$", "iu").test(normalized))) continue;
     line = line.replace(cleanUrl, (url) => {
       const u = url.toLowerCase();
-      return aliases.some((a) => { const bare = a.replace(/^@/, "").toLowerCase(); return bare && new RegExp("(?:t\\.me|telegram\\.me)/" + rxEscape(bare) + "(?:/|$)", "i").test(u); }) ? "" : url;
+      return /(?:t\.me|telegram\.me)\/(?:khozkhabar|akhbartehran|iribnews1405)(?:\/|$)/i.test(u) ? "" : url;
     });
     // Remove channel handles attached to obvious promotional footer text.
     if (/(?:معرفی|عضو شوید|دنبال کنید|دوستانتان|کانال تلگرام)/iu.test(line) && /@[A-Za-z0-9_]{4,}/.test(line)) continue;
     kept.push(line);
   }
   text = kept.join("\n");
+  for (const a of aliases) {
+    const bare = a.replace(/^@/, "");
+    if (!bare) continue;
+    text = text.replace(new RegExp("(?<![\\p{L}\\p{N}_])@?" + rxEscape(bare) + "(?![\\p{L}\\p{N}_])", "giu"), "");
+  }
   text = text.replace(/\b@@+/g, "@").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   text = stripTrailingSourceHandle(text);
   if (dest) {
@@ -1927,7 +1739,8 @@ async function receiveSourceChannelPost(env, post) {
   const matches = [];
   for (const id of store.order) {
     const p = store.items[id];
-    if (!p || (env.CONTROL_PROFILE_ID && String(p.id) !== String(env.CONTROL_PROFILE_ID)) || p.locked === true || p.enabled === false || subExpired(p) || p.sourceChannelMode === "off") continue;
+    if (!p || (env.CONTROL_PROFILE_ID && String(p.id) !== String(env.CONTROL_PROFILE_ID)) || p.enabled === false || subExpired(p) || p.sourceChannelMode === "off") continue;
+    if (!await profileSessionActive(env, p.id)) continue;
     if (sourceChannelMatch(p, chat, sourcePlatform)) matches.push(p);
   }
   if (!matches.length) return;
@@ -2042,13 +1855,11 @@ async function receiveSourceChannelPost(env, post) {
     };
     if (raw && env.GROQ_API_KEY) { try { item.translatedText = await translateSourceToPersian(env, raw); } catch(e) { item.translationError = String(e?.message || e).slice(0,220); console.error("source translation:",e?.message||e); } }
     const sourceMediaSize = Number(post.video?.file_size || post.document?.file_size || photos[photos.length - 1]?.file_size || 0);
-    await withProfileStateLock(env, p.id, async () => {
-      const initialState = await getState(env, p.id), initialDay = statDay(initialState);
-      initialDay.u.received++;
-      initialDay.u.contentBytes += new TextEncoder().encode(full).length;
-      initialDay.u.mediaBytes += sourceMediaSize;
-      await putState(env, p.id, initialState);
-    });
+    const initialState = await getState(env, p.id), initialDay = statDay(initialState);
+    initialDay.u.received++;
+    initialDay.u.contentBytes += new TextEncoder().encode(full).length;
+    initialDay.u.mediaBytes += sourceMediaSize;
+    await putState(env, p.id, initialState);
     const allowed = sourceRouteFor(p, chat, sourcePlatform);
     if (allowed) item.targetPlatforms = allowed;
     if (p.sourceChannelMode === "auto") {
@@ -2219,7 +2030,15 @@ async function manualProfilesView(env, userId) {
   const list = await scopedProfiles(env, userId), kb = [];
   for (const p of list) {
     const id = p.id;
-    kb.push([{ text: `📰 ${cut(p.name, 24)}`, callback_data: `mdp:${id}` }]);
+    let ready = 0;
+    for (const pid of PLATS) {
+      const x = await buildPlatform(env, p, pid, true);
+      if (x) ready++;
+    }
+    const st = await getState(env, id), lim = subDaily(p, await getPlans(env)), used = usedToday(st), days = subRemainingDays(p);
+    const quota = lim ? `${used}/${lim} \u0627\u0645\u0631\u0648\u0632` : "\u0646\u0627\u0645\u062D\u062F\u0648\u062F";
+    const remain = subExpired(p) ? "\u0645\u0646\u0642\u0636\u06CC" : days === null ? "\u0628\u062F\u0648\u0646 \u0627\u0646\u0642\u0636\u0627" : `${days} \u0631\u0648\u0632`;
+    kb.push([{ text: `\u{1F4F0} ${cut(p.name, 18)} \u2014 ${ready} \u0645\u0642\u0635\u062F | ${quota} | ${remain}`, callback_data: `mdp:${id}` }]);
   }
   kb.push([{ text: "\u2B05\uFE0F \u0628\u0627\u0632\u06AF\u0634\u062A \u0628\u0647 \u0645\u0646\u0648\u06CC \u0627\u0635\u0644\u06CC", callback_data: "h" }]);
   const scope = await controlProfileScope(env, userId);
@@ -2270,6 +2089,9 @@ async function manualDraftView(env, userId) {
   if (!p) return { text: "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0627\u06CC\u0646 \u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.", kb: [[{ text: "\u{1F3E0} \u0645\u0646\u0648\u06CC \u0627\u0635\u0644\u06CC", callback_data: "h" }]] };
   if (!await canControlProfile(env, userId, p.id)) return { text: "\u0627\u06CC\u0646 \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0628\u0647 \u0634\u0646\u0627\u0633\u0647 \u062A\u0644\u06AF\u0631\u0627\u0645 \u0634\u0645\u0627 \u0627\u062E\u062A\u0635\u0627\u0635 \u062F\u0627\u062F\u0647 \u0646\u0634\u062F\u0647 \u0627\u0633\u062A.", kb: [[{ text: "\u{1F3E0} \u0645\u0646\u0648\u06CC \u0627\u0635\u0644\u06CC", callback_data: "h" }]] };
   const kb = [];
+  const st = await getState(env, p.id), lim = subDaily(p, await getPlans(env)), used = usedToday(st), left = subRemainingDays(p);
+  const quota = lim ? `\u0633\u0647\u0645\u06CC\u0647 \u0627\u0645\u0631\u0648\u0632: ${used} \u0627\u0632 ${lim} \u062E\u0628\u0631 (${Math.max(0, lim - used)} \u0628\u0627\u0642\u06CC\u200C\u0645\u0627\u0646\u062F\u0647)` : "\u0633\u0647\u0645\u06CC\u0647 \u0627\u0645\u0631\u0648\u0632: \u0646\u0627\u0645\u062D\u062F\u0648\u062F";
+  const days = subExpired(p) ? "\u26D4 \u0627\u0634\u062A\u0631\u0627\u06A9 \u0645\u0646\u0642\u0636\u06CC \u0634\u062F\u0647" : left === null ? "\u0645\u062F\u062A: \u0628\u062F\u0648\u0646 \u0627\u0646\u0642\u0636\u0627" : `\u0631\u0648\u0632\u0647\u0627\u06CC \u0628\u0627\u0642\u06CC\u200C\u0645\u0627\u0646\u062F\u0647: ${left}`;
   for (let i = 0; i < d.available.length; i += 2) {
     const row = [];
     for (const id of d.available.slice(i, i + 2)) row.push({ text: `${d.selected.includes(id) ? "\u2705" : "\u2B1C"} ${LABELS[id]}`, callback_data: `mdt:${id}` });
@@ -2293,6 +2115,8 @@ ${esc(body)}` : ""}`;
 ${d.unsupported.map((id) => `\u2022 ${LABELS[id]} \u2014 \u0627\u0631\u0633\u0627\u0644 \u0622\u0644\u0628\u0648\u0645 \u062F\u0631 \u0627\u06CC\u0646 \u0646\u0633\u062E\u0647 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646\u06CC \u0646\u0645\u06CC\u200C\u0634\u0648\u062F`).join("\n")}` : "";
   return { text: `<b>\u067E\u06CC\u0634\u200C\u0646\u0645\u0627\u06CC\u0634 \u062E\u0628\u0631 \u062F\u0633\u062A\u06CC</b>
 \u067E\u0631\u0648\u0641\u0627\u06CC\u0644: ${esc(p.name)}
+${days}
+${quota}
 \u0646\u0648\u0639 \u0645\u062D\u062A\u0648\u0627: ${media}
 
 ${preview}${destinations ? `
@@ -2464,29 +2288,33 @@ async function manualDuplicateCheck(env, p, item) {
   const paragraph = normalizeManualParagraph(item.manualMediaCaption ? item.manualCaptionText : `${item.title || ""}
 ${item.full || item.summary || ""}`);
   const hash = await sha256(paragraph);
-  const scopedHashKey = `${p.id}:${hash}`;
-  if (await env.BOT_KV.get("manual:dedup:" + scopedHashKey) || await env.BOT_KV.get("manual:attempted-content:" + scopedHashKey)) {
+  if (await env.BOT_KV.get("manual:dedup:" + hash) || await env.BOT_KV.get("manual:attempted-content:" + hash)) {
     return { duplicate: true, paragraph, profile: "\u062E\u0628\u0631 \u062F\u0633\u062A\u06CC \u0642\u0628\u0644\u06CC \u06CC\u0627 \u062A\u0644\u0627\u0634 \u0627\u0646\u062A\u0634\u0627\u0631 \u0642\u0628\u0644\u06CC" };
   }
   if (paragraph.length >= 18) {
     const tokens = titleTokens(paragraph);
-    const st = await getState(env, p.id);
-    if (findSimilar(tokens, st.tt, DEDUP.normal, Date.now())) return { duplicate: true, paragraph, profile: p.name || p.id };
+    const store = await getProfiles(env);
+    for (const pid of store.order) {
+      const profile = store.items[pid];
+      if (!profile) continue;
+      const st = await getState(env, pid);
+      if (findSimilar(tokens, st.tt, DEDUP.normal, Date.now())) {
+        return { duplicate: true, paragraph, profile: profile.name || pid };
+      }
+    }
   }
   return { duplicate: false, paragraph, hash };
 }
 __name(manualDuplicateCheck, "manualDuplicateCheck");
 async function recordManualParagraph(env, p, paragraph, hash) {
   const tokens = titleTokens(paragraph);
-  await withProfileStateLock(env, p.id, async () => {
-    const st = await getState(env, p.id);
-    if (tokens.length) st.tt.push({ t: tokens.slice(0, 12).join(" "), at: Date.now() });
-    await putState(env, p.id, st);
-  });
-  if (hash) await env.BOT_KV.put(`manual:dedup:${p.id}:${hash}`, String(Date.now()), { expirationTtl: 30 * 24 * 60 * 60 });
+  const st = await getState(env, p.id);
+  if (tokens.length) st.tt.push({ t: tokens.slice(0, 12).join(" "), at: Date.now() });
+  await putState(env, p.id, st);
+  if (hash) await env.BOT_KV.put("manual:dedup:" + hash, String(Date.now()), { expirationTtl: 30 * 24 * 60 * 60 });
 }
 __name(recordManualParagraph, "recordManualParagraph");
-async function publishManualDraftUnlocked(env, userId) {
+async function publishManualDraft(env, userId) {
   const key = `manual:draft:${userId}`;
   let d = null;
   try {
@@ -2505,7 +2333,7 @@ async function publishManualDraftUnlocked(env, userId) {
   }
   if (d.manualHash) {
     for (const id of d.selected.filter((x) => !(d.alreadyPublished || []).includes(x))) {
-      if (await env.BOT_KV.get(`manual:attempt:${d.pid}:${d.manualHash}:${id}`)) {
+      if (await env.BOT_KV.get(`manual:attempt:${d.manualHash}:${id}`)) {
         throw new Error(`\u0628\u0631\u0627\u06CC \u062C\u0644\u0648\u06AF\u06CC\u0631\u06CC \u0627\u0632 \u0627\u0646\u062A\u0634\u0627\u0631 \u0686\u0646\u062F\u0628\u0627\u0631\u0647\u060C \u0645\u0642\u0635\u062F ${LABELS[id]} \u0642\u0628\u0644\u0627\u064B \u0628\u0631\u0627\u06CC \u0627\u06CC\u0646 \u0645\u062A\u0646 \u062A\u0644\u0627\u0634 \u0634\u062F\u0647 \u0627\u0633\u062A. \u0627\u0628\u062A\u062F\u0627 \u06A9\u0627\u0646\u0627\u0644 \u0645\u0642\u0635\u062F \u0631\u0627 \u0628\u0631\u0631\u0633\u06CC \u06A9\u0646\u061B \u0627\u0631\u0633\u0627\u0644 \u0645\u062C\u062F\u062F \u062E\u0648\u062F\u06A9\u0627\u0631 \u0627\u0646\u062C\u0627\u0645 \u0646\u0645\u06CC\u200C\u0634\u0648\u062F.`);
       }
     }
@@ -2523,11 +2351,11 @@ async function publishManualDraftUnlocked(env, userId) {
     await env.BOT_KV.put(key, JSON.stringify(d), { expirationTtl: 7200 });
     throw e;
   }
-  if (!p || p.locked === true) {
+  if (!p) {
     d.publishing = false;
     delete d.publishingAt;
     await env.BOT_KV.put(key, JSON.stringify(d), { expirationTtl: 7200 });
-    throw new Error(p?.locked === true ? "این پروفایل توسط مدیر قفل شده است." : "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0627\u0646\u062A\u0634\u0627\u0631 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.");
+    throw new Error("\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0627\u0646\u062A\u0634\u0627\u0631 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.");
   }
   if (!await canControlProfile(env, userId, p.id)) {
     d.publishing = false;
@@ -2550,8 +2378,8 @@ async function publishManualDraftUnlocked(env, userId) {
       const x = await buildPlatform(env, p, id, true);
       if (!x) throw new Error("\u062A\u0646\u0638\u06CC\u0645\u0627\u062A \u0645\u0642\u0635\u062F \u06A9\u0627\u0645\u0644 \u0646\u06CC\u0633\u062A.");
       if (d.manualHash) {
-        await env.BOT_KV.put(`manual:attempted-content:${d.pid}:${d.manualHash}`, "attempted", { expirationTtl: 30 * 24 * 60 * 60 });
-        await env.BOT_KV.put(`manual:attempt:${d.pid}:${d.manualHash}:${id}`, "attempted", { expirationTtl: 30 * 24 * 60 * 60 });
+        await env.BOT_KV.put(`manual:attempted-content:${d.manualHash}`, "attempted", { expirationTtl: 30 * 24 * 60 * 60 });
+        await env.BOT_KV.put(`manual:attempt:${d.manualHash}:${id}`, "attempted", { expirationTtl: 30 * 24 * 60 * 60 });
       }
       const runtimeItem = {
         ...d.item,
@@ -2587,14 +2415,6 @@ async function publishManualDraftUnlocked(env, userId) {
     await env.BOT_KV.delete(key);
   }
   return { results, failed, retryView: failed.length ? await manualDraftView(env, userId) : null };
-}
-__name(publishManualDraftUnlocked, "publishManualDraftUnlocked");
-async function publishManualDraft(env, userId) {
-  const key = `manual:draft:${userId}`;
-  const owner = await acquireD1Lock(env, `manual-publish-lock:${userId}`, 600);
-  if (!owner) throw new Error("این خبر در حال انتشار است؛ لطفاً چند لحظه صبر کنید.");
-  try { return await publishManualDraftUnlocked(env, userId); }
-  finally { await releaseD1Lock(env, `manual-publish-lock:${userId}`, owner).catch(() => {}); }
 }
 __name(publishManualDraft, "publishManualDraft");
 async function setupSourceWebhooks(req, env) {
@@ -2666,7 +2486,6 @@ async function handleControl(env, u) {
         await telegram(tok, "sendMessage", { chat_id: chat.id, text: "پروفایل پیدا نشد." }, false);
         return;
       }
-      if (powerProfile.locked === true && powerText === PROFILE_ON_TEXT) { await telegram(tok, "sendMessage", { chat_id: chat.id, text: "این پروفایل توسط مدیر قفل شده است؛ برای فعال‌سازی با مدیر سامانه تماس بگیرید." }, false); return; }
       powerProfile.enabled = powerText === PROFILE_ON_TEXT;
       await putProfiles(env, powerStore);
       await env.BOT_KV.delete(`ctl-session:${pid}`);
@@ -2682,7 +2501,7 @@ async function handleControl(env, u) {
       return;
     }
     if (powerText === PROFILE_MENU_TEXT) {
-      const v = await canUseGlobalControl(env, from.id) ? await ctlProfilesView(env, from.id) : await ctlCustomerProfileView(env, pid);
+      const v = await ctlProfilesView(env, from.id);
       await telegram(tok, "sendMessage", { chat_id: chat.id, text: v.text, parse_mode: "HTML", ...kbMarkup(v.kb) }, false);
       return;
     }
@@ -2701,7 +2520,7 @@ async function handleControl(env, u) {
         const view = await storeManualTelegramAlbum(env, from.id, msg, manualState.pid);
         await telegram(tok, "sendMessage", { chat_id: chat.id, text: view.text }, false);
       } catch (e) {
-        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u274C \u0627\u0645\u06A9\u0627\u0646 \u067E\u0631\u062F\u0627\u0632\u0634 \u0641\u0627\u06CC\u0644 \u0641\u0631\u0627\u0647\u0645 \u0646\u06CC\u0633\u062A؛ \u0646\u0648\u0639 \u0648 \u062D\u062C\u0645 \u0641\u0627\u06CC\u0644 \u0631\u0627 \u0628\u0631\u0631\u0633\u06CC \u06A9\u0646\u06CC\u062F." }, false);
+        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u274C " + String(e.message || e).slice(0, 300) }, false);
       }
       return;
     }
@@ -2715,7 +2534,7 @@ async function handleControl(env, u) {
         const view = await makeManualDraft(env, from.id, msg, manualState.pid, manualState);
         await telegram(tok, "sendMessage", { chat_id: chat.id, text: view.text, parse_mode: "HTML", ...kbMarkup(view.kb) }, false);
       } catch (e) {
-        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u274C \u0627\u0645\u06A9\u0627\u0646 \u0627\u0646\u062C\u0627\u0645 \u0639\u0645\u0644\u06CC\u0627\u062A \u0641\u0631\u0627\u0647\u0645 \u0646\u06CC\u0633\u062A. \u0645\u062D\u062A\u0648\u0627 \u0631\u0627 \u062F\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062A\u06CC\u062F \u06CC\u0627 /cancel \u0631\u0627 \u0628\u0631\u0627\u06CC \u0644\u063A\u0648 \u0628\u0632\u0646." }, false);
+        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u274C " + String(e.message || e).slice(0, 350) + "\n\u062F\u0648\u0628\u0627\u0631\u0647 \u0645\u062D\u062A\u0648\u0627 \u0631\u0627 \u0628\u0641\u0631\u0633\u062A \u06CC\u0627 /cancel \u0631\u0627 \u0628\u0631\u0627\u06CC \u0644\u063A\u0648 \u0628\u0632\u0646." }, false);
       }
       return;
     }
@@ -2735,12 +2554,11 @@ async function handleControl(env, u) {
         const r = await applyAdminEditedText(env, from.id, msg.text);
         await telegram(tok, "sendMessage", { chat_id: chat.id, text: r?.error || "\u2705 \u0645\u062A\u0646 \u0648\u06CC\u0631\u0627\u06CC\u0634 \u0634\u062F." }, false);
       } catch (e) {
-        await telegram(tok, "sendMessage", { chat_id: chat.id, text: await canUseGlobalControl(env, from.id) ? "\u0648\u06CC\u0631\u0627\u06CC\u0634 \u0627\u0646\u062C\u0627\u0645 \u0646\u0634\u062F: " + String(e.message).slice(0, 250) : "امکان ویرایش فراهم نیست؛ دوباره تلاش کنید." }, false).catch(() => {
+        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u0648\u06CC\u0631\u0627\u06CC\u0634 \u0627\u0646\u062C\u0627\u0645 \u0646\u0634\u062F: " + String(e.message).slice(0, 250) }, false).catch(() => {
         });
       }
       return;
     }
-    if (inputState && !await canUseGlobalControl(env, from.id)) { await env.BOT_KV.delete(`ctl-input:${from.id}`); inputState = null; }
     if (inputState && msg.text && !/^\/(start|cancel)(?:@\w+)?$/i.test(msg.text.trim())) {
       if (inputState.pid && !await canControlProfile(env, from.id, inputState.pid)) {
         await env.BOT_KV.delete(`ctl-input:${from.id}`);
@@ -2848,7 +2666,7 @@ async function handleControl(env, u) {
           return;
         }
       } catch (e) {
-        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u274C \u0627\u0645\u06A9\u0627\u0646 \u0627\u0646\u062C\u0627\u0645 \u0627\u06CC\u0646 \u0639\u0645\u0644\u06CC\u0627\u062A \u0641\u0631\u0627\u0647\u0645 \u0646\u06CC\u0633\u062A. \u0645\u062D\u062A\u0648\u0627 \u0631\u0627 \u0628\u0631\u0631\u0633\u06CC \u06A9\u0646\u06CC\u062F \u06CC\u0627 \u0628\u0627 \u0645\u062F\u06CC\u0631 \u062A\u0645\u0627\u0633 \u0628\u06AF\u06CC\u0631\u06CC\u062F. \u0628\u0631\u0627\u06CC \u0644\u063A\u0648 /cancel \u0631\u0627 \u0628\u0641\u0631\u0633\u062A\u06CC\u062F." }, false);
+        await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u274C " + String(e.message).slice(0, 350) + "\n\u0628\u0631\u0627\u06CC \u0644\u063A\u0648 /cancel \u0631\u0627 \u0628\u0641\u0631\u0633\u062A\u06CC\u062F." }, false);
         return;
       }
     }
@@ -2861,21 +2679,20 @@ async function handleControl(env, u) {
       return;
     }
     try {
-      const v = await canUseGlobalControl(env, from.id) ? await ctlProfilesView(env, from.id) : await ctlCustomerProfileView(env, pid);
-      await telegram(tok, "sendMessage", { chat_id: chat.id, text: v.text, parse_mode: "HTML", ...profilePowerMarkup(await profileSessionActive(env, pid)) }, false);
+      const v = await ctlProfilesView(env, from.id);
+      await telegram(tok, "sendMessage", { chat_id: chat.id, text: v.text, ...profilePowerMarkup(await profileSessionActive(env, pid)) }, false);
     } catch (e) {
-      await telegram(tok, "sendMessage", { chat_id: chat.id, text: await canUseGlobalControl(env, from.id) ? "\u062E\u0637\u0627 \u062F\u0631 \u0633\u0627\u062E\u062A \u0645\u0646\u0648: " + String(e.message).slice(0, 250) : "امکان نمایش منو فراهم نیست؛ دوباره تلاش کنید." }, false).catch(() => {
+      await telegram(tok, "sendMessage", { chat_id: chat.id, text: "\u062E\u0637\u0627 \u062F\u0631 \u0633\u0627\u062E\u062A \u0645\u0646\u0648: " + String(e.message).slice(0, 250) }, false).catch(() => {
       });
     }
     return;
   }
   const d = String(cb.data || ""), ans = /* @__PURE__ */ __name((text) => telegram(tok, "answerCallbackQuery", { callback_query_id: cb.id, ...text ? { text } : {} }, false).catch(() => {
   }), "ans");
-  if (!await profileSessionActive(env, pid) && !d.startsWith("pt:")) return await ans((currentProfile?.locked === true) ? "این پروفایل توسط مدیر قفل شده است." : "ابتدا ربات را روشن کنید.");
-  const profileCb = d.match(/^(?:p|ch|st|run|q|oq|pqa|pqac|mdp|cst|ca|rt|cm|pt|cp|cr|rd|a|at|r|e|m|od|oa|fadd|fdel|ba|bl|sp|ea|er):([^:]+)/);
+  if (!await profileSessionActive(env, pid) && !d.startsWith("pt:")) return await ans("ابتدا ربات را روشن کنید.");
+  const profileCb = d.match(/^(?:p|ch|st|run|q|pqa|pqac|mdp|ca|rt|cm|pt|cp|cr|rd|a|r|e|m|od|oa|fadd|fdel|ba|bl|sp):([^:]+)/);
   if (profileCb && !await canControlProfile(env, from.id, profileCb[1])) return await ans("\u0627\u06CC\u0646 \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0628\u0647 \u0634\u0646\u0627\u0633\u0647 \u062A\u0644\u06AF\u0631\u0627\u0645 \u0634\u0645\u0627 \u0627\u062E\u062A\u0635\u0627\u0635 \u062F\u0627\u062F\u0647 \u0646\u0634\u062F\u0647 \u0627\u0633\u062A.");
-  if (profileCb && !await canUseGlobalControl(env, from.id) && !["p", "q", "pt", "mdp", "cst", "a", "at", "r", "e"].includes(d.split(":")[0])) return await ans("این بخش در دسترس حساب مشتری نیست.");
-  if (["ov", "pl", "pe", "us", "cs"].includes(d) && !await canUseGlobalControl(env, from.id)) return await ans("\u0627\u06CC\u0646 \u0628\u062E\u0634 \u0641\u0642\u0637 \u0628\u0631\u0627\u06CC \u0645\u062F\u06CC\u0631 \u0627\u0635\u0644\u06CC \u062F\u0631 \u062F\u0633\u062A\u0631\u0633 \u0627\u0633\u062A.");
+  if (["ov", "pl", "pe", "us"].includes(d) && !await canUseGlobalControl(env, from.id)) return await ans("\u0627\u06CC\u0646 \u0628\u062E\u0634 \u0641\u0642\u0637 \u0628\u0631\u0627\u06CC \u0645\u062F\u06CC\u0631 \u0627\u0635\u0644\u06CC \u062F\u0631 \u062F\u0633\u062A\u0631\u0633 \u0627\u0633\u062A.");
   const edit = /* @__PURE__ */ __name(async (v) => {
     try {
       await telegram(tok, "editMessageText", { chat_id: chat.id, message_id: cb.message.message_id, text: v.text, parse_mode: "HTML", ...kbMarkup(v.kb) }, false);
@@ -2886,24 +2703,19 @@ async function handleControl(env, u) {
   try {
     if (d === "n") return await ans();
     if (d === "h") {
-      const view = await canUseGlobalControl(env, from.id) ? await ctlProfilesView(env, from.id) : await ctlCustomerProfileView(env, pid);
-      await edit(view);
+      await edit(await ctlProfilesView(env, from.id));
       return await ans();
     }
     if (d === "md") {
-      const pid2 = pid, p = (await getProfiles(env)).items[pid2];
-      if (!p) return await ans("پروفایل در دسترس نیست.");
-      await env.BOT_KV.delete(`manual:draft:${from.id}`);
-      await env.BOT_KV.put(`manual:state:${from.id}`, JSON.stringify({ step: "content", pid: pid2 }), { expirationTtl: 1800 });
-      await telegram(tok, "sendMessage", { chat_id: chat.id, text: "✍️ متن یا رسانه خبر را ارسال کنید. برای لغو /cancel را بفرستید." }, false);
-      return await ans("منتظر دریافت خبر هستم.");
+      await edit(await manualProfilesView(env, from.id));
+      return await ans();
     }
     if (d.startsWith("mdp:")) {
       const pid2 = d.slice(4), store = await getProfiles(env), p = store.items[pid2];
       if (!p) return await ans("\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.");
       await env.BOT_KV.delete(`manual:draft:${from.id}`);
       await env.BOT_KV.put(`manual:state:${from.id}`, JSON.stringify({ step: "content", pid: pid2 }), { expirationTtl: 1800 });
-      await telegram(tok, "sendMessage", { chat_id: chat.id, text: `✍️ محتوای خبر را ارسال کنید.
+      await telegram(tok, "sendMessage", { chat_id: chat.id, text: `\u270D\uFE0F \u0645\u062D\u062A\u0648\u0627\u06CC \u062E\u0628\u0631 \u0631\u0627 \u0628\u0631\u0627\u06CC \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \xAB${p.name}\xBB \u0628\u0641\u0631\u0633\u062A.
 
 \u2022 \u0645\u062A\u0646 \u0633\u0627\u062F\u0647: \u062E\u0637 \u0627\u0648\u0644 \u062A\u06CC\u062A\u0631 \u0648 \u062E\u0637\u0648\u0637 \u0628\u0639\u062F\u06CC \u0645\u062A\u0646 \u062E\u0628\u0631 \u0628\u0627\u0634\u062F.
 \u2022 \u06CC\u06A9 \u0639\u06A9\u0633/\u0648\u06CC\u062F\u06CC\u0648 \u0631\u0627 \u0645\u06CC\u200C\u062A\u0648\u0627\u0646\u06CC \u0647\u0645\u0631\u0627\u0647 \u06A9\u067E\u0634\u0646 \u0628\u0641\u0631\u0633\u062A\u06CC.
@@ -2937,19 +2749,16 @@ async function handleControl(env, u) {
       return await ans("\u067E\u06CC\u0634\u200C\u0646\u0648\u06CC\u0633 \u062D\u0630\u0641 \u0634\u062F.");
     }
     if (d === "mdpub") {
-      const globalOperator = await canUseGlobalControl(env, from.id);
       try {
         const out = await publishManualDraft(env, from.id);
-        const lines = globalOperator
-          ? out.results.map((x) => `${x.ok ? "\u2705" : "\u274C"} ${LABELS[x.id]}: ${esc(x.message)}`)
-          : [`انتشار موفق: ${out.results.filter((x) => x.ok).length}`, `نیازمند بررسی: ${out.failed.length}`];
+        const lines = out.results.map((x) => `${x.ok ? "\u2705" : "\u274C"} ${LABELS[x.id]}: ${esc(x.message)}`);
         if (out.failed.length) {
-          await edit({ text: "<b>\u0646\u062A\u06CC\u062C\u0647 \u0627\u0631\u0633\u0627\u0644 \u062E\u0628\u0631 \u062F\u0633\u062A\u06CC</b>\n" + lines.join("\n") + (globalOperator ? "\n\n\u0645\u0642\u0635\u062F\u0647\u0627\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0627\u0646\u062A\u062E\u0627\u0628 \u0634\u062F\u0647\u200C\u0627\u0646\u062F\u061B \u0628\u0631\u0627\u06CC \u062A\u0644\u0627\u0634 \u062F\u0648\u0628\u0627\u0631\u0647 \u062F\u06A9\u0645\u0647 \u0627\u0646\u062A\u0634\u0627\u0631 \u0631\u0627 \u0628\u0632\u0646." : "\n\nبرخی مقصدها منتشر نشدند؛ خبر را بررسی و دوباره تلاش کنید."), kb: out.retryView.kb });
+          await edit({ text: "<b>\u0646\u062A\u06CC\u062C\u0647 \u0627\u0631\u0633\u0627\u0644 \u062E\u0628\u0631 \u062F\u0633\u062A\u06CC</b>\n" + lines.join("\n") + "\n\n\u0645\u0642\u0635\u062F\u0647\u0627\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0627\u0646\u062A\u062E\u0627\u0628 \u0634\u062F\u0647\u200C\u0627\u0646\u062F\u061B \u0628\u0631\u0627\u06CC \u062A\u0644\u0627\u0634 \u062F\u0648\u0628\u0627\u0631\u0647 \u062F\u06A9\u0645\u0647 \u0627\u0646\u062A\u0634\u0627\u0631 \u0631\u0627 \u0628\u0632\u0646.", kb: out.retryView.kb });
         } else {
           await edit({ text: "<b>\u0627\u0646\u062A\u0634\u0627\u0631 \u062E\u0628\u0631 \u062F\u0633\u062A\u06CC \u0627\u0646\u062C\u0627\u0645 \u0634\u062F</b>\n" + lines.join("\n"), kb: [[{ text: "\u270D\uFE0F \u0627\u0631\u0633\u0627\u0644 \u062E\u0628\u0631 \u062F\u06CC\u06AF\u0631", callback_data: "md" }, { text: "\u{1F3E0} \u0645\u0646\u0648\u06CC \u0627\u0635\u0644\u06CC", callback_data: "h" }]] });
         }
       } catch (e) {
-        await ans(globalOperator ? String(e.message || e).slice(0, 180) : "امکان انجام انتشار فراهم نیست؛ لطفاً خبر و وضعیت ربات را بررسی کنید.");
+        await ans(String(e.message || e).slice(0, 180));
       }
       return;
     }
@@ -3093,13 +2902,7 @@ async function handleControl(env, u) {
       return await ans("منبع RSS حذف شد.");
     }
     if (d.startsWith("p:")) {
-      const pid2 = d.slice(2);
-      const view = await canUseGlobalControl(env, from.id) ? await ctlFeedsView(env, pid2) : await ctlCustomerProfileView(env, pid2);
-      await edit(view);
-      return await ans();
-    }
-    if (d.startsWith("cst:")) {
-      await edit(await ctlCustomerStatsView(env, d.slice(4)));
+      await edit(await ctlFeedsView(env, d.slice(2)));
       return await ans();
     }
     if (d.startsWith("ch:")) {
@@ -3245,11 +3048,9 @@ async function handleControl(env, u) {
     if (d.startsWith("pt:")) {
       const pid2 = d.slice(3), store = await getProfiles(env), p = store.items[pid2];
       if (!p) return await ans("\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.");
-      if (p.locked === true) return await ans("این پروفایل توسط مدیر قفل شده است.");
       p.enabled = p.enabled === false;
       await putProfiles(env, store);
-      const view = await canUseGlobalControl(env, from.id) ? await ctlFeedsView(env, pid2) : await ctlCustomerProfileView(env, pid2);
-      await edit(view);
+      await edit(await ctlFeedsView(env, pid2));
       return await ans(p.enabled ? "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0641\u0639\u0627\u0644 \u0634\u062F." : "\u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0645\u062A\u0648\u0642\u0641 \u0634\u062F.");
     }
     if (d.startsWith("run:")) {
@@ -3338,10 +3139,12 @@ ${String(r.message || "").slice(0, 1200)}` }, false);
         await telegram(tok, "editMessageReplyMarkup", { chat_id: chat.id, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [[{ text: label, callback_data: "n" }]] } }, false).catch(() => {
         });
       }
-      const globalOperator = await canUseGlobalControl(env, from.id);
-      await ans(globalOperator ? String(res.message || "\u0639\u0645\u0644\u06CC\u0627\u062A \u0627\u0646\u062C\u0627\u0645 \u0634\u062F.").slice(0, 190) : (res.ok ? "خبر پردازش شد." : "امکان انتشار کامل فراهم نشد؛ وضعیت خبر را در فهرست انتظار بررسی کنید."));
+      await ans(String(res.message || "\u0639\u0645\u0644\u06CC\u0627\u062A \u0627\u0646\u062C\u0627\u0645 \u0634\u062F.").slice(0, 190));
       if (isApprove) {
-        const report = globalOperator ? ["\u{1F4CA} \u06AF\u0632\u0627\u0631\u0634 \u0646\u062A\u06CC\u062C\u0647 \u0627\u0646\u062A\u0634\u0627\u0631", `\u067E\u0631\u0648\u0641\u0627\u06CC\u0644: ${p.name || pid2}`, String(res.message || ""), ...(res.successful?.length ? ["\u2705 \u0645\u0648\u0641\u0642: " + res.successful.join("\u060C ")] : []), ...(res.failed?.length ? ["\u274C \u0646\u0627\u0645\u0648\u0641\u0642: " + res.failed.join("\u060C ")] : []), ...(res.errors?.length ? ["\u062C\u0632\u0626\u06CC\u0627\u062A \u062E\u0637\u0627: " + res.errors.join(" | ")] : [])] : [res.ok ? "✅ انتشار انجام شد." : "⚠️ انتشار کامل نشد؛ خبر در صف بررسی باقی مانده است."];
+        const report = ["\u{1F4CA} \u06AF\u0632\u0627\u0631\u0634 \u0646\u062A\u06CC\u062C\u0647 \u0627\u0646\u062A\u0634\u0627\u0631", `\u067E\u0631\u0648\u0641\u0627\u06CC\u0644: ${p.name || pid2}`, String(res.message || "")];
+        if (res.successful?.length) report.push("\u2705 \u0645\u0648\u0641\u0642: " + res.successful.join("\u060C "));
+        if (res.failed?.length) report.push("\u274C \u0646\u0627\u0645\u0648\u0641\u0642: " + res.failed.join("\u060C "));
+        if (res.errors?.length) report.push("\u062C\u0632\u0626\u06CC\u0627\u062A \u062E\u0637\u0627: " + res.errors.join(" | "));
         await telegram(tok, "sendMessage", { chat_id: chat.id, text: report.join("\n\n").slice(0, 3900) }, false).catch((e) => console.error("publication report notify:", e?.message || e));
       }
       return;
@@ -3356,8 +3159,7 @@ ${String(r.message || "").slice(0, 1200)}` }, false);
     }
     await ans();
   } catch (e) {
-    const globalOperator = await canUseGlobalControl(env, from.id);
-    await ans(globalOperator ? "\u062E\u0637\u0627: " + String(e.message).slice(0, 150) : "امکان انجام این عملیات فراهم نیست؛ دوباره تلاش کنید.");
+    await ans("\u062E\u0637\u0627: " + String(e.message).slice(0, 150));
   }
 }
 __name(handleControl, "handleControl");
@@ -3842,7 +3644,7 @@ function findDate(html2) {
     d = +r[3];
     at = r.index;
   } else {
-    r = text.match(new RegExp("(\\d{1,2})\\s+(" + MONTHS_FA.join("|") + ")\\s+(1[34]\\d\\d)"));
+    r = text.match(new RegExp("(\\d{1,2})s+(" + MONTHS_FA.join("|") + ")s+(1[34]\\d\\d)"));
     if (!r) return 0;
     d = +r[1];
     mo = MONTHS_FA.indexOf(r[2]) + 1;
@@ -5364,8 +5166,8 @@ async function overviewApi(env) {
     const st = await getState(env, id);
     const day = st.sx[today] || {};
     const q = await getQueue(env, id);
-    const enabled = p.enabled !== false && p.locked !== true;
-    const sessionActive = enabled;
+    const enabled = p.enabled !== false;
+    const sessionActive = await profileSessionActive(env, id);
     const feeds = (p.feeds || []).filter((u) => !(p.off || []).includes(u)).length;
     if (enabled && sessionActive) activeProfiles++;
     totalFeeds += feeds;
@@ -5722,7 +5524,7 @@ function eitaaPostMedia(block) {
   }
   for (const m of source.matchAll(/<video\b[^>]*>/gi)) add(htmlAttr(m[0], "src") || htmlAttr(m[0], "data-src") || htmlAttr(m[0], "data-video"), "video");
   for (const m of source.matchAll(/<source\b[^>]*>/gi)) add(htmlAttr(m[0], "src") || htmlAttr(m[0], "data-src"), "video");
-  for (const m of source.matchAll(/<[^>]+\b(?:data-video|data-video-url|data-mp4|data-file)\s*=\s*["']([^"']+)["'][^>]*>/gi)) {
+  for (const m of source.matchAll(/<[^>]+\\b(?:data-video|data-video-url|data-mp4|data-file)\\s*=\\s*["']([^"']+)["'][^>]*>/gi)) {
     const kind = /\.(?:mp4|m4v|webm|mov)(?:[?#]|$)/i.test(m[1]) ? "video" :
       /\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt)(?:[?#]|$)/i.test(m[1]) ? "document" : "photo";
     add(m[1], kind);
@@ -6050,10 +5852,10 @@ async function pollPublicSourceChannels(env, onlyProfile = "", lockOwner = "") {
     if (onlyProfile && String(pid) !== String(onlyProfile)) return;
     const p = store.items[pid];
     if (!p) { result.skipped.push(`پروفایل ${pid} پیدا نشد`); return; }
-    if (p.locked === true) { result.skipped.push(`پروفایل ${p.name || pid} توسط مدیر قفل شده است`); return; }
     if (p.enabled === false) { result.skipped.push(`پروفایل ${p.name || pid} خاموش است`); return; }
     if (subExpired(p)) { result.skipped.push(`اشتراک پروفایل ${p.name || pid} منقضی است`); return; }
     if (p.sourceChannelMode === "off") { result.skipped.push(`پایش منابع در پروفایل ${p.name || pid} متوقف است`); return; }
+    if (!await profileSessionActive(env, p.id)) { result.skipped.push(`پروفایل ${p.name || pid} فعال تشخیص داده نشد`); return; }
     const srcs = [
       ...(p.sourceChannels || []).slice(0, 5).map(value => ({ platform: "tg", value })),
       ...((p.sourceChannelsByPlatform || {}).eitaa || []).slice(0, 5).map(value => ({ platform: "eitaa", value })),
@@ -6255,7 +6057,7 @@ function parseBalePublicPage(html, username) {
   return out.sort((a,b)=>a.message_id-b.message_id);
 }
 
-async function handleSourceWebhook(req,env,url){const a=url.pathname.split("/").filter(Boolean),platform=a[1],pid=a[2],secret=a[3];if(!PLATS.includes(platform)||!pid||!secret)return json({ok:false},404);const store=await getProfiles(env),p=store.items[pid];if(!p||secret!==p.sourceWebhookKey)return json({ok:false},403);if(p.locked===true)return json({ok:true,locked:true});let b={};try{b=await req.json();}catch{return json({ok:false},400);}const post=b.message||b.channel_post||b.edited_channel_post||b;post.sourcePlatform=platform;const lockKey=`profile-source-lock:${pid}`;const owner=await acquireD1Lock(env,lockKey,600);if(!owner)return json({ok:false,retry:true},503);try{const msgKey=post.update_id||`${post.message_id||post.id||""}:${post.edit_date||0}`;const eventKey=msgKey?`source-update:${pid}:${platform}:${msgKey}`:"";if(eventKey&&await env.BOT_KV.get(eventKey))return json({ok:true,duplicate:true});await receiveSourceChannelPost(env,post);if(eventKey)await claimD1Event(env,eventKey,30*86400);}finally{await releaseD1Lock(env,lockKey,owner).catch(()=>{});}return json({ok:true});}
+async function handleSourceWebhook(req,env,url){const a=url.pathname.split("/").filter(Boolean),platform=a[1],pid=a[2],secret=a[3];if(!PLATS.includes(platform)||!pid||!secret)return json({ok:false},404);const store=await getProfiles(env),p=store.items[pid];if(!p||secret!==p.sourceWebhookKey)return json({ok:false},403);let b={};try{b=await req.json();}catch{return json({ok:false},400);}const post=b.message||b.channel_post||b.edited_channel_post||b;post.sourcePlatform=platform;await receiveSourceChannelPost(env,post);return json({ok:true});}
 function publicUsername(value) {
   let x = String(value || "").trim().replace(/^https?:\/\/(?:www\.)?t\.me\//i, "").replace(/^s\//i, "").replace(/[?#].*$/, "").replace(/\/\d+.*$/, "").replace(/\/+$/, "").replace(/^@/, "");
   return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(x) ? x.toLowerCase() : "";
@@ -6305,36 +6107,6 @@ async function releaseCronLock(env, owner) {
   } catch (e) { console.error("Cron lock release:", e?.message || e); }
 }
 __name(releaseCronLock, "releaseCronLock");
-async function acquireD1Lock(env, key, ttlSeconds = 180) {
-  const now = Math.floor(Date.now() / 1000);
-  const owner = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const row = await env.DB.prepare(
-    "INSERT INTO app_kv (key, value, expires_at, updated_at) VALUES (?1, ?2, ?3, ?4) " +
-    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at, updated_at=excluded.updated_at " +
-    "WHERE app_kv.expires_at IS NOT NULL AND app_kv.expires_at <= ?4 RETURNING value"
-  ).bind(key, owner, now + ttlSeconds, now).first();
-  return row?.value === owner ? owner : null;
-}
-async function releaseD1Lock(env, key, owner) {
-  if (!owner) return;
-  await env.DB.prepare("DELETE FROM app_kv WHERE key = ?1 AND value = ?2").bind(key, owner).run();
-}
-async function claimD1Event(env, key, ttlSeconds = 86400) {
-  const now = Math.floor(Date.now() / 1000);
-  const row = await env.DB.prepare(
-    "INSERT INTO app_kv (key, value, expires_at, updated_at) VALUES (?1, '1', ?2, ?3) " +
-    "ON CONFLICT(key) DO UPDATE SET value='1', expires_at=excluded.expires_at, updated_at=excluded.updated_at " +
-    "WHERE app_kv.expires_at IS NOT NULL AND app_kv.expires_at <= ?3 RETURNING key"
-  ).bind(key, now + ttlSeconds, now).first();
-  return !!row;
-}
-async function withProfileStateLock(env, pid, fn) {
-  const key = `profile-state-lock:${pid}`;
-  const owner = await acquireD1Lock(env, key, 600);
-  if (!owner) throw new Error("به‌روزرسانی وضعیت پروفایل هم‌زمان است؛ دوباره تلاش کنید.");
-  try { return await fn(); }
-  finally { await releaseD1Lock(env, key, owner).catch(() => {}); }
-}
 async function mapWithConcurrency(items, concurrency, mapper) {
   const out = new Array(items.length);
   let next = 0;
@@ -6362,9 +6134,11 @@ async function runAll(env, opts = {}) {
     catch (e) { console.error("public source polling:", e?.stack || e); }
     let list = store.order.map((id) => store.items[id]).filter(Boolean);
     if (opts.only) list = list.filter((p) => p.id === opts.only);
-    else list = list.filter((p) => p.enabled !== false && p.locked !== true);
+    else list = list.filter((p) => p.enabled !== false);
     // No round-robin slicing: every enabled profile is considered on every Cron.
-    list = list.filter((p) => p.enabled !== false && p.locked !== true);
+    const sessionChecks = await Promise.all(list.map(async (p) => [p.id, await profileSessionActive(env, p.id)]));
+    const activeSessions = new Set(sessionChecks.filter((x) => x[1]).map((x) => x[0]));
+    list = list.filter((p) => activeSessions.has(p.id));
     let results = {};
     try { results = JSON.parse(await env.BOT_KV.get("meta:results")) || {}; } catch {}
     const plans2 = await getPlans(env);
@@ -6397,8 +6171,7 @@ async function runAll(env, opts = {}) {
   }
 }
 __name(runAll, "runAll");
-async function runProfileUnlocked(env, p, bud, plans2, force) {
-  const startedAt = Date.now();
+async function runProfile(env, p, bud, plans2, force) {
   const at = (/* @__PURE__ */ new Date()).toISOString();
   const done = /* @__PURE__ */ __name((r) => ({ ...r, at }), "done");
   try {
@@ -6415,12 +6188,10 @@ async function runProfileUnlocked(env, p, bud, plans2, force) {
     const manualSet = new Set(p.manual || []);
     const fullSet = new Set(p.fullFeeds || []);
     const linkSet = new Set(p.linkFeeds || []);
-    if (bud.n + feeds.length > SUB_BUDGET) return done({ ok: true, message: "سقف پردازش این نوبت تکمیل شد؛ ادامهٔ منابع در اجرای بعدی انجام می‌شود." });
     bud.n += feeds.length;
     const fetched = await Promise.allSettled(feeds.map((u) => fetchFeed(u)));
     const byFeed = [], feedErrs = [];
     for (let i = 0; i < feeds.length; i++) {
-      if (bud.n > SUB_BUDGET || Date.now() - startedAt > 30000) break;
       const r = fetched[i];
       if (r.status === "fulfilled") {
         const fid = (await sha256(feeds[i])).slice(0, 10);
@@ -6671,14 +6442,6 @@ async function runProfileUnlocked(env, p, bud, plans2, force) {
     return done({ ok: false, message: e.message || "\u062E\u0637\u0627\u06CC \u0646\u0627\u0645\u0634\u062E\u0635" });
   }
 }
-__name(runProfileUnlocked, "runProfileUnlocked");
-async function runProfile(env, p, bud, plans2, force) {
-  const lockKey = `profile-run-lock:${p.id}`;
-  const owner = await acquireD1Lock(env, lockKey, 600);
-  if (!owner) return { ok: true, at: new Date().toISOString(), message: "اجرای این پروفایل در درخواست دیگری در حال انجام است؛ این نوبت برای جلوگیری از تداخل رد شد." };
-  try { return await runProfileUnlocked(env, p, bud, plans2, force); }
-  finally { await releaseD1Lock(env, lockKey, owner).catch(() => {}); }
-}
 __name(runProfile, "runProfile");
 function loginPage() {
   return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>\u0648\u0631\u0648\u062F</title>${styles()}</head><body><main class="box"><h1>\u0648\u0631\u0648\u062F \u0628\u0647 \u067E\u0646\u0644</h1><form id="f"><label>\u0631\u0645\u0632 \u0639\u0628\u0648\u0631</label><input id="p" type="password" autocomplete="current-password" required autofocus><button class="btn" type="submit">\u0648\u0631\u0648\u062F</button><div id="m" class="msg"></div></form></main><script>document.getElementById('f').addEventListener('submit',async function(e){e.preventDefault();var b=e.target.querySelector('button');b.disabled=true;var m=document.getElementById('m');m.textContent='\u062F\u0631 \u062D\u0627\u0644 \u0628\u0631\u0631\u0633\u06CC...';try{var r=await fetch('/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:document.getElementById('p').value})});var d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||'\u0648\u0631\u0648\u062F \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062F');location.href='/'}catch(x){m.textContent=x.message;b.disabled=false}});<\/script></body></html>`;
@@ -6790,7 +6553,7 @@ ${S("\u0639\u06CC\u0628\u200C\u06CC\u0627\u0628\u06CC \u0633\u0631\u06CC\u0639",
 }
 __name(guideHtml, "guideHtml");
 function adminPage() {
-  return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>\u067E\u0646\u0644 \u0631\u0628\u0627\u062A \u062E\u0628\u0631</title>${styles()}</head><body><main class="box"><header class="topbar"><div class="topbar-title"><h1>ربات انتشار خبر چندپلتفرمی</h1><small>مدیریت منابع، کانال‌ها و گزارش‌ها</small></div><button id="out" class="ghost">خروج از پنل</button></header><div class="welcome-mark">KH<span>\u2022</span> BOT</div>
+  return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>\u067E\u0646\u0644 \u0631\u0628\u0627\u062A \u062E\u0628\u0631</title>${styles()}</head><body><main class="box"><header class="topbar"><div class="topbar-title"><h1>ربات انتشار خبر چندپلتفرمی</h1><small>مدیریت منابع، کانال‌ها و گزارش‌ها</small></div><button id="out" class="ghost">خروج از پنل</button></header><div class="welcome-mark">KH<span>\u2022</span> BOT</div></div>
 <section class="overview-card" id="overview"><div class="overview-head"><div><b>\u0646\u0645\u0627\u06CC \u06A9\u0644\u06CC \u0639\u0645\u0644\u06A9\u0631\u062F \u0631\u0628\u0627\u062A</b><small id="overview-updated">\u0622\u0645\u0627\u0631 \u0627\u0645\u0631\u0648\u0632 \u0628\u0647 \u0648\u0642\u062A \u062A\u0647\u0631\u0627\u0646</small></div><button type="button" id="overview-refresh" class="sec sm">\u0628\u0647\u200C\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06CC</button></div><div id="overview-body" class="overview-body"><div class="overview-loading">\u062F\u0631 \u062D\u0627\u0644 \u062C\u0645\u0639\u200C\u0622\u0648\u0631\u06CC \u0622\u0645\u0627\u0631\u2026</div></div></section>
 <div class="admin-layout"><div class="admin-content">
 ${guideHtml()}
@@ -6799,7 +6562,7 @@ ${guideHtml()}
 <div class="identity-grid"><div class="compact-field"><label for="pname">\u0646\u0627\u0645 \u067E\u0631\u0648\u0641\u0627\u06CC\u0644</label><input id="pname" placeholder="\u0645\u062B\u0644\u0627\u064B \u0627\u06CC\u0633\u0646\u0627 \u062E\u0648\u0632\u0633\u062A\u0627\u0646"></div>
 <div class="compact-field"><label for="owner">\u0635\u0627\u062D\u0628 / \u0627\u062F\u0645\u06CC\u0646 (\u0627\u062E\u062A\u06CC\u0627\u0631\u06CC)</label><input id="owner" placeholder="\u0646\u0627\u0645 \u0635\u0627\u062D\u0628 \u0631\u0628\u0627\u062A \u06CC\u0627 \u06A9\u0627\u0646\u0627\u0644"><small>\u0641\u0642\u0637 \u0628\u0631\u0627\u06CC \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0627\u0633\u062A.</small></div>
 <div class="compact-field" style="grid-column:1/-1"><label for="controlBotToken">\u062A\u0648\u06A9\u0646 \u0631\u0628\u0627\u062A \u0645\u062F\u06CC\u0631\u06CC\u062A \u0627\u062E\u062A\u0635\u0627\u0635\u06CC \u0627\u06CC\u0646 \u0645\u0634\u062A\u0631\u06CC</label><input id="controlBotToken" type="password" dir="ltr" autocomplete="off" placeholder="\u062A\u0648\u06A9\u0646 \u062C\u062F\u0627\u06AF\u0627\u0646\u0647 BotFather \u0628\u0631\u0627\u06CC \u0631\u0628\u0627\u062A \u0645\u062F\u06CC\u0631\u06CC\u062A \u0627\u06CC\u0646 \u067E\u0631\u0648\u0641\u0627\u06CC\u0644"><small>\u0627\u06CC\u0646 \u062A\u0648\u06A9\u0646 \u0628\u0627 \u062A\u0648\u06A9\u0646 \u0631\u0628\u0627\u062A \u0645\u0642\u0635\u062F \u0627\u0646\u062A\u0634\u0627\u0631 \u062A\u0644\u06AF\u0631\u0627\u0645 \u0641\u0631\u0642 \u062F\u0627\u0631\u062F. \u0645\u0634\u062A\u0631\u06CC \u062E\u0648\u062F\u0634 \u0631\u0628\u0627\u062A \u0631\u0627 \u0641\u0639\u0627\u0644 \u0645\u06CC\u200C\u06A9\u0646\u062F\u061B \u062A\u0648\u06A9\u0646 \u0628\u0647\u200C\u0635\u0648\u0631\u062A \u0631\u0645\u0632\u0646\u06AF\u0627\u0631\u06CC\u200C\u0634\u062F\u0647 \u0630\u062E\u06CC\u0631\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F \u0648 \u062F\u0648\u0628\u0627\u0631\u0647 \u0646\u0645\u0627\u06CC\u0634 \u062F\u0627\u062F\u0647 \u0646\u0645\u06CC\u200C\u0634\u0648\u062F.</small></div><div class="compact-field" style="grid-column:1/-1"><label for="controlUsers">شناسه عددی مدیران همکار تلگرام (حداکثر ۲ نفر)</label><textarea id="controlUsers" rows="2" dir="ltr" placeholder="123456789\n987654321"></textarea><small>شناسه عددی هر مدیر را در یک خط وارد کن. مالک اصلی به‌صورت جداگانه دسترسی دارد؛ این مدیران فقط به همین پروفایل دسترسی خواهند داشت. برای پیدا کردن شناسه می‌توانند به ربات @userinfobot پیام بدهند.</small></div></div>
-<label class="tg" style="margin-top:12px"><input type="checkbox" id="penabled"> \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0641\u0639\u0627\u0644 \u0628\u0627\u0634\u062F</label><label class="tg"><input type="checkbox" id="plocked"> قفل مدیریتی پروفایل (فقط از پنل مدیر)</label>
+<label class="tg" style="margin-top:12px"><input type="checkbox" id="penabled"> \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0641\u0639\u0627\u0644 \u0628\u0627\u0634\u062F</label>
 <div class="card" id="subcard"><div class="ch"><b>\u0627\u0634\u062A\u0631\u0627\u06A9 \u0648 \u0645\u062D\u062F\u0648\u062F\u06CC\u062A\u200C\u0647\u0627</b><button type="button" id="s_renew" class="sec sm">\u0634\u0631\u0648\u0639 \u0645\u062F\u062A \u0627\u0632 \u0627\u0645\u0631\u0648\u0632</button></div>
 <label>\u0633\u0642\u0641 \u062E\u0628\u0631 \u0645\u062C\u0627\u0632 \u062F\u0631 \u0631\u0648\u0632 (\u0647\u0631 \u062E\u0628\u0631\u060C \u062D\u062A\u06CC \u062F\u0631 \u0686\u0646\u062F \u067E\u0644\u062A\u0641\u0631\u0645\u060C \u06CC\u06A9 \u0648\u0627\u062D\u062F)</label>
 <select id="s_tier"><option value="none">\u0646\u0627\u0645\u062D\u062F\u0648\u062F</option><option value="bronze">\u0628\u0631\u0646\u0632\u06CC</option><option value="silver">\u0646\u0642\u0631\u0647\u200C\u0627\u06CC</option><option value="gold">\u0637\u0644\u0627\u06CC\u06CC</option><option value="custom">\u062F\u0644\u062E\u0648\u0627\u0647 (\u0639\u062F\u062F \u062F\u0633\u062A\u06CC)</option></select>
@@ -6838,7 +6601,7 @@ https://t.me/s/another_channel"></textarea><small>\u06A9\u0627\u0646\u0627\u0644
 <div id="m" class="msg"></div>
 <div class="info">\u0622\u062E\u0631\u06CC\u0646 \u0646\u062A\u06CC\u062C\u0647\u200C\u06CC \u062B\u0628\u062A\u200C\u0634\u062F\u0647: <b id="lr">\u2014</b> <small>(RSS \u0647\u0631 \u06F1 \u062F\u0642\u06CC\u0642\u0647 \u0686\u06A9 \u0645\u06CC\u200C\u0634\u0648\u062F\u061B \u0628\u0631\u0627\u06CC \u0635\u0631\u0641\u0647\u200C\u062C\u0648\u06CC\u06CC \u062F\u0631 \u0646\u0648\u0634\u062A\u0646 KV\u060C \u0627\u06CC\u0646 \u0632\u0645\u0627\u0646 \u0641\u0642\u0637 \u0648\u0642\u062A\u06CC \u0646\u062A\u06CC\u062C\u0647 \u0639\u0648\u0636 \u0634\u0648\u062F \u06CC\u0627 \u062D\u062F\u0627\u06A9\u062B\u0631 \u0647\u0631 \u06CC\u06A9 \u0633\u0627\u0639\u062A \u062A\u0627\u0632\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F)</small></div><div class="info">\u0646\u062A\u06CC\u062C\u0647: <b id="res">\u2014</b></div>
 
-<div class="bottom-grid" id="bottom-grid">
+<div class="bottom-grid">
 <div class="card" id="stats"><div class="ch"><b>\u0622\u0645\u0627\u0631 \u0648 \u06AF\u0632\u0627\u0631\u0634 \u0627\u0646\u062A\u0634\u0627\u0631</b><span><select id="srange" style="width:auto;padding:4px 8px"><option value="7">\u06F7 \u0631\u0648\u0632 \u0627\u062E\u06CC\u0631</option><option value="30">\u06F3\u06F0 \u0631\u0648\u0632 \u0627\u062E\u06CC\u0631</option></select> <button type="button" id="sref" class="sec sm">\u0628\u0647\u200C\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06CC</button></span></div><div id="sbody"><small>\u062F\u0631 \u062D\u0627\u0644 \u062F\u0631\u06CC\u0627\u0641\u062A...</small></div><small>\u0622\u0645\u0627\u0631 \u0628\u0631\u0627\u06CC \u067E\u0631\u0648\u0641\u0627\u06CC\u0644 \u0627\u0646\u062A\u062E\u0627\u0628\u200C\u0634\u062F\u0647 \u0627\u0633\u062A \u0648 \u0627\u0632 \u0647\u0645\u06CC\u0646 \u0646\u0633\u062E\u0647 \u0628\u0647 \u0628\u0639\u062F \u062C\u0645\u0639 \u0645\u06CC\u200C\u0634\u0648\u062F. \xAB\u062E\u0637\u0627\u06CC \u062F\u0631\u06CC\u0627\u0641\u062A RSS\xBB \u0647\u0631 \u062F\u0642\u06CC\u0642\u0647 \u06CC\u06A9\u200C\u0628\u0627\u0631 \u0634\u0645\u0631\u062F\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F \u0648 \u0641\u0642\u0637 \u0648\u0642\u062A\u06CC \u0630\u062E\u06CC\u0631\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F \u06A9\u0647 \u0647\u0645\u0627\u0646 \u0627\u062C\u0631\u0627 \u0686\u06CC\u0632 \u062F\u06CC\u06AF\u0631\u06CC \u0647\u0645 \u0646\u0648\u0634\u062A\u0647 \u0634\u0648\u062F.</small></div>
 <div class="card" id="plans"><div class="ch"><b>\u062A\u0646\u0638\u06CC\u0645 \u067E\u0644\u0646\u200C\u0647\u0627 (\u0628\u0631\u0627\u06CC \u0647\u0645\u0647\u200C\u06CC \u067E\u0631\u0648\u0641\u0627\u06CC\u0644\u200C\u0647\u0627)</b><button type="button" id="plsave" class="sec sm">\u0630\u062E\u06CC\u0631\u0647\u200C\u06CC \u067E\u0644\u0646\u200C\u0647\u0627</button></div>
 <label>\u062A\u0639\u062F\u0627\u062F \u062E\u0628\u0631 \u062F\u0631 \u0631\u0648\u0632 \u0628\u0631\u0627\u06CC \u0647\u0631 \u0633\u0637\u062D</label>
@@ -7016,7 +6779,7 @@ function fill(){
 controlActivationLink='';if($('ctlcopy'))$('ctlcopy').style.display='none';
 var p=g(cur)||{name:'',enabled:true,feeds:[],dedup:'normal',manual:[],pending:0,site:'',sig:'',showLink:true,sub:{tier:'none',daily:0,dur:'none',days:0,expiresAt:0},plats:{tg:{on:true,chat:'',tokenConfigured:false}},result:null};
 var s=p.sub||{tier:'none',daily:0,dur:'none',days:0,expiresAt:0};
-$('pname').value=p.name;$('owner').value=p.owner||'';$('controlBotToken').value='';$('controlUsers').value=(p.controlUsers||[]).join('\n');$('controlBotToken').placeholder=p.controlBotConfigured?'توکن ذخیره شده است؛ برای حفظ آن خالی بگذار':'توکن جداگانه BotFather برای ربات مدیریت این پروفایل';$('penabled').checked=!!p.enabled;if($('plocked'))$('plocked').checked=!!p.locked;$('sourceChannels').value=(p.sourceChannels||[]).join('\n');var sc=p.sourceChannelsByPlatform||{};$('sourceBale').value=(sc.bale||[]).join('\n');$('sourceEitaa').value=(sc.eitaa||[]).join('\n');$('sourceRubika').value=(sc.rubika||[]).join('\n');$('sourceWa').value=(sc.wa||[]).join('\n');$('sourceChannelMode').value=p.sourceChannelMode||'auto';sourceRouteMap=p.sourceChannelRoutes||{};sourceRouteRender();$('sourceHookUrls').innerHTML='<div>پایش کانال‌های عمومی تلگرام، ایتا و بله از طریق Cron انجام می‌شود و نیازی به وب‌هوک یا مدیرکردن ربات در کانال مبدا نیست.</div>';setFeeds(p.feeds,p.manual,p.off,p.fullFeeds,p.linkFeeds,p.feedNames);$('dedup').value=p.dedup||'normal';$('site').value=p.site;
+$('pname').value=p.name;$('owner').value=p.owner||'';$('controlBotToken').value='';$('controlUsers').value=(p.controlUsers||[]).join('\n');$('controlBotToken').placeholder=p.controlBotConfigured?'توکن ذخیره شده است؛ برای حفظ آن خالی بگذار':'توکن جداگانه BotFather برای ربات مدیریت این پروفایل';$('penabled').checked=!!p.enabled;$('sourceChannels').value=(p.sourceChannels||[]).join('\n');var sc=p.sourceChannelsByPlatform||{};$('sourceBale').value=(sc.bale||[]).join('\n');$('sourceEitaa').value=(sc.eitaa||[]).join('\n');$('sourceRubika').value=(sc.rubika||[]).join('\n');$('sourceWa').value=(sc.wa||[]).join('\n');$('sourceChannelMode').value=p.sourceChannelMode||'auto';sourceRouteMap=p.sourceChannelRoutes||{};sourceRouteRender();$('sourceHookUrls').innerHTML='<div>پایش کانال‌های عمومی تلگرام، ایتا و بله از طریق Cron انجام می‌شود و نیازی به وب‌هوک یا مدیرکردن ربات در کانال مبدا نیست.</div>';setFeeds(p.feeds,p.manual,p.off,p.fullFeeds,p.linkFeeds,p.feedNames);$('dedup').value=p.dedup||'normal';$('site').value=p.site;
 $('s_tier').value=s.tier;$('s_daily').value=s.tier==='custom'?s.daily:'';$('s_dur').value=s.dur;$('s_days').value=s.dur==='custom'?s.days:'';
 $('s_exp').value=s.expiresAt?gDateToJalali(new Date(s.expiresAt).toISOString().slice(0,10)):'';tierSync();durSync();$('s_status').textContent=subStatus(g(cur));
 P.forEach(function(x){var c=(p.plats||{})[x.id]||{};$('on_'+x.id).checked=!!c.on;$('chat_'+x.id).value=c.chat||'';$('sig_'+x.id).value=c.sig||'';$('foot_'+x.id).value=c.footer||'';$('tok_'+x.id).value='';
@@ -7031,7 +6794,7 @@ $('sourceHookSetup').onclick=async function(){if(!cur){$('sourceHookResult').tex
 function collect(){var p={};P.forEach(function(x){p[x.id]={on:$('on_'+x.id).checked,chat:$('chat_'+x.id).value,sig:$('sig_'+x.id).value,footer:$('foot_'+x.id).value,token:$('tok_'+x.id).value}});
 var feeds=[].slice.call(document.querySelectorAll('#feedlist .fr')).map(function(r){var u=r.querySelector('.fu').value.trim(),m=r.querySelector('.fm').value;return{url:u,mode:(r.getAttribute('data-ou')===u&&r.getAttribute('data-om')===m)?'keep':m,text:r.querySelector('.ft').value,link:r.querySelector('.fl').value==='1',name:r.querySelector('.fn').value.trim()}}).filter(function(f){return f.url});
 var sub={tier:$('s_tier').value,daily:$('s_daily').value,dur:$('s_dur').value,days:durDays(),expires:jalaliInputToGregorian($('s_exp').value)};
-return{id:cur,name:$('pname').value,owner:$('owner').value,controlBotToken:$('controlBotToken').value,controlUsers:$('controlUsers').value.split(/[\s,;،]+/).filter(Boolean),enabled:$('penabled').checked,locked:$('plocked').checked,feeds:feeds,sourceChannels:$('sourceChannels').value.split(/\s+/).filter(Boolean),sourceChannelsByPlatform:{bale:$('sourceBale').value.split(/\s+/).filter(Boolean),eitaa:$('sourceEitaa').value.split(/\s+/).filter(Boolean),rubika:$('sourceRubika').value.split(/\s+/).filter(Boolean),wa:$('sourceWa').value.split(/\s+/).filter(Boolean)},sourceChannelMode:$('sourceChannelMode').value,sourceChannelRoutesText:collectSourceRoutes(),dedup:$('dedup').value,site:$('site').value,sub:sub,p:p}}
+return{id:cur,name:$('pname').value,owner:$('owner').value,controlBotToken:$('controlBotToken').value,controlUsers:$('controlUsers').value.split(/[\s,;،]+/).filter(Boolean),enabled:$('penabled').checked,feeds:feeds,sourceChannels:$('sourceChannels').value.split(/\s+/).filter(Boolean),sourceChannelsByPlatform:{bale:$('sourceBale').value.split(/\s+/).filter(Boolean),eitaa:$('sourceEitaa').value.split(/\s+/).filter(Boolean),rubika:$('sourceRubika').value.split(/\s+/).filter(Boolean),wa:$('sourceWa').value.split(/\s+/).filter(Boolean)},sourceChannelMode:$('sourceChannelMode').value,sourceChannelRoutesText:collectSourceRoutes(),dedup:$('dedup').value,site:$('site').value,sub:sub,p:p}}
 function act(id,text,fn){$(id).onclick=async function(){var b=$(id);b.disabled=true;show(true,text);try{var d=await fn();show(true,d.message)}catch(e){show(false,e.message)}b.disabled=false}}
 act('save','در حال ذخیره...',async function(){var d=await api('/api/profile/save',collect());cur=d.id;await load(true);return d});
 act('run','در حال بررسی و ارسال...',async function(){if(!cur)throw Error('اول پروفایل را ذخیره کنید.');var d=await api('/api/run',{id:cur});await load(true);loadUsage();return d});
